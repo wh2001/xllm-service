@@ -45,10 +45,10 @@ class InstanceMgr final {
  public:
 
   const std::vector<std::pair<std::string, std::string>> MODELS = {
-    {"Qwen3-0.6B", "/export/home/models/Qwen3-0.6B"},
-    {"Qwen3-1.7B", "/export/home/models/Qwen3-1.7B"},
-    {"Qwen2.5-3B", "/export/home/models/Qwen3-4B"},
-    {"Qwen3-4B", "/export/home/models/Qwen3-4B"},
+    // {"Qwen3-0.6B", "/export/home/models/Qwen3-0.6B"},
+    // {"Qwen3-1.7B", "/export/home/models/Qwen3-1.7B"},
+    // {"Qwen2.5-3B", "/export/home/models/Qwen3-4B"},
+    // {"Qwen3-4B", "/export/home/models/Qwen3-4B"},
     {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
     {"Qwen2-7B", "/export/home/models/Qwen2-7B"}
     // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"},
@@ -128,6 +128,8 @@ class InstanceMgr final {
   std::vector<std::string> get_awake_prefill_instances(const std::string& model_id);
   std::vector<std::string> get_awake_decode_instances(const std::string& model_id);
   int count_awake_models_on_instance(const std::string& instance_name);
+  // Count models with WAKEUP or ALLOCATED state on an instance (includes in-flight wakeups)
+  int count_active_models_on_instance(const std::string& instance_name);
   InstanceTag get_instance_tag(const std::string& instance_name) const;
   void set_instance_tag(const std::string& instance_name, InstanceTag tag);
   bool is_model_waking_up(const std::string& model_id);
