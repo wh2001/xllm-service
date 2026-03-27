@@ -90,9 +90,16 @@ class Options {
   // Disable steady pool: all models go to elastic pool with PD disaggregation
   PROPERTY(bool, disable_steady_pool) = false;
 
+  // Disable elastic pool: all models stay in steady pool, no dynamic scaling
+  PROPERTY(bool, disable_elastic_pool) = false;
+
   // Fixed instance count per model when disable_steady_pool is true.
   // 0 = use all available instances; >= 2 = fixed count.
   PROPERTY(int32_t, elastic_instance_count) = 0;
+
+  // Path to JSON file that maps service names to model paths.
+  // When non-empty, MODELS is loaded from this file at startup.
+  PROPERTY(std::string, models_config_path);
 };
 
 }  // namespace xllm_service

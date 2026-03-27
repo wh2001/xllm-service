@@ -44,24 +44,10 @@ namespace xllm_service {
 class InstanceMgr final {
  public:
 
-  const std::vector<std::pair<std::string, std::string>> MODELS = {
-    // {"Qwen3-0.6B", "/export/home/models/Qwen3-0.6B"},
-    // {"Qwen3-1.7B", "/export/home/models/Qwen3-1.7B"},
-    // {"Qwen2.5-3B", "/export/home/models/Qwen3-4B"},
-    // {"Qwen3-4B", "/export/home/models/Qwen3-4B"},
-    {"Qwen3-8B", "/export/home/models/Qwen3-8B"},
-    {"Qwen2-7B", "/export/home/models/Qwen2-7B"}
-    // {"Qwen2.5-14B", "/export/home/models/Qwen2.5-14B"},
-    // {"Qwen3-4B", "/export/home/models/Qwen3-4B"}
-    // {"Qwen2.5-3b", "/export/home/models/Qwen2.5-3b"}
-    // {"Qwen3-30B-A3B-Instruct-2507", "/export/home/models/Qwen3-30B-A3B-Instruct-2507"}
-    // {"Qwen3-30B-A3B-W8A8", "/export/home/models/Qwen3-30B-A3B-W8A8"},
-    // {"Qwen3-32B-W8A8", "/export/home/models/Qwen3-32B-W8A8"}
-  };
+  // Loaded from models_config_path JSON at startup; each pair is
+  // {service_name, model_path}.  Populated by load_models_config() in init().
+  std::vector<std::pair<std::string, std::string>> MODELS;
 
-  std::atomic<uint16_t> master_node_port = 40033;
-  std::atomic<uint16_t> disagg_pd_port_ = 29084;
-  
   static constexpr int kMaxWakeupTimeoutms = 10000;
 
   static constexpr int kTensorParallelSize = 1;
@@ -115,12 +101,13 @@ class InstanceMgr final {
   void send_model_sleep(const std::string& instance_name,
                         const std::string& model_id);
 
-  void send_model_wakeup(const std::string& instance_name,
+  bool send_model_wakeup(const std::string& instance_name,
                          const std::string& model_id,
                          bool memory_increased_in_advance);
 
   void update_model_heat(const std::string& model_id,
-                         int64_t token_count);
+                         int64_t token_count,
+                         int64_t input_len);
   
   int32_t get_wakeup_count(const std::string& model_id);
 
@@ -144,7 +131,8 @@ class InstanceMgr final {
   bool try_dynamic_part_auto_scaling();
 
   // Signal the auto-scaling thread and wait until the model has at least one
-  // WAKEUP instance (or timeout). Used for cold elastic model first-request path.
+  // PREFILL and one DECODE instance in WAKEUP state (or timeout).
+  // Used for cold elastic model first-request path.
   void request_cold_elastic_wakeup(const std::string& model_id);
 
   std::shared_ptr<ModelInstanceMgr> get_model_instance_mgr(const std::string& model_id);
@@ -219,6 +207,11 @@ class InstanceMgr final {
   void load_gp_dynamic_models(const std::string& path);
   double get_model_memory_size(const std::string& model_id);
 
+  // Load MODELS from the JSON file specified by options_.models_config_path().
+  // Each JSON element must have "service" and "model_path" string fields.
+  // Aborts with a fatal log if the path is empty or the file cannot be parsed.
+  void load_models_config();
+
   // --- Dual-pool private helpers ---
 
   // Auto-scaling implementation. Must be called with allocation_mutex_ held.
@@ -246,8 +239,11 @@ class InstanceMgr final {
   std::vector<std::tuple<std::string, std::string, std::string>>
       remove_model_from_steady_bin(const std::string& model_id);
 
-  // Get resource needs for a model using its current heat.
+  // Get resource needs for a model using its current traffic stats (GP 4D input).
   ResourceNeeds get_model_resource_needs(const std::string& model_id);
+
+  // Compute GPU target using traffic stats (preferred over legacy heat-only interface).
+  int32_t compute_gpu_target_for_model(const std::string& model_id);
 
   // Check if instance is in the steady pool
   bool is_steady_pool_instance(const std::string& instance_name);
@@ -411,8 +407,18 @@ class InstanceMgr final {
   std::unordered_map<std::string, std::unique_ptr<ResourceModel>> model_resource_models_;
   // model_id -> dynamic pool GP resource model (read-only after init)
   std::unordered_map<std::string, std::unique_ptr<ResourceModel>> dynamic_resource_models_;
+  // alias model_id -> real model_id for GP resource model lookup (read-only after init)
+  std::unordered_map<std::string, std::string> alias_to_real_model_;
   // GPU hardware spec (read-only after init)
   GpuHardwareSpec gpu_hw_spec_;
+
+  // Resolve alias model_id to real model_id for GP resource model lookup.
+  // Returns the real model_id if an alias mapping exists, otherwise returns
+  // the input model_id unchanged.
+  const std::string& resolve_gp_model_id(const std::string& model_id) const {
+    auto it = alias_to_real_model_.find(model_id);
+    return (it != alias_to_real_model_.end()) ? it->second : model_id;
+  }
 
   // --- Dual-pool state (protected by allocation_mutex_) ---
   // model_id -> which pool it belongs to
@@ -425,6 +431,11 @@ class InstanceMgr final {
   int32_t pending_steady_gpus_ = 0;
   // Repack timer thread
   std::unique_ptr<std::thread> repack_thread_;
+
+  // --- Orphan cleanup state (accessed only from log_model_pd_counts thread) ---
+  // Tracks when a model was first detected as orphaned (pool=NONE, heat=0, awake instances)
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+      orphan_detected_time_;
 
   // --- Scaling plan anti-jitter state (protected by allocation_mutex_) ---
   struct ScalingPlanEntry {

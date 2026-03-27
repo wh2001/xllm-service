@@ -131,7 +131,7 @@ DEFINE_bool(enable_prefill_only_mode,
             "(prefill-only elastic pool mode).");
 
 DEFINE_double(gpu_hbm_per_gpu_gb,
-              80.0,
+              60.0,
               "HBM capacity per GPU in GB, used for auto-scaling resource model.");
 
 DEFINE_double(gpu_compute_sm_per_gpu,
@@ -146,6 +146,12 @@ DEFINE_bool(enable_mix_pd,
 DEFINE_double(gpu_bandwidth_per_gpu,
               1.0,
               "HBM-to-SRAM bandwidth capacity per GPU (normalized).");
+
+DEFINE_string(model_alias_map_path,
+              "",
+              "Path to JSON file mapping alias model IDs to real model IDs "
+              "for GP resource model lookup. Format: {\"alias\": \"real\", ...}. "
+              "Empty means no alias mapping (model IDs used as-is).");
 
 DEFINE_string(gp_steady_data_path,
               "",
@@ -162,8 +168,20 @@ DEFINE_bool(disable_steady_pool,
             "When true, disable steady pool entirely. All models are assigned "
             "to the elastic pool with PD disaggregation enabled.");
 
+DEFINE_bool(disable_elastic_pool,
+            false,
+            "When true, disable elastic pool entirely. All models are assigned "
+            "to the steady pool only, no PD disaggregation or dynamic scaling.");
+
 DEFINE_int32(elastic_instance_count,
              0,
              "Fixed number of instances per model when disable_steady_pool is "
              "true. 0 means use all available instances. Must be >= 2 if set "
              "to a positive value.");
+
+DEFINE_string(models_config_path,
+              "",
+              "Path to JSON file containing the list of (service, model_path) "
+              "pairs to be served. Each entry must have \"service\" and "
+              "\"model_path\" fields. When set, this file is loaded at startup "
+              "instead of using the hardcoded MODELS list.");

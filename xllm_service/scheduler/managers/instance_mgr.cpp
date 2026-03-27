@@ -19,6 +19,10 @@ limitations under the License.
 #include <brpc/controller.h>
 #include <glog/logging.h>
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <chrono>
 #include <fstream>
 #include <thread>
@@ -40,21 +44,51 @@ limitations under the License.
 
 namespace xllm_service {
 
+// Obtain a free port from the OS by binding to port 0.
+// Returns -1 on failure.
+static int get_free_port() {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    LOG(ERROR) << "get_free_port: socket() failed, errno=" << errno;
+    return -1;
+  }
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_port = htons(0);
+  if (bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+    ::close(fd);
+    LOG(ERROR) << "get_free_port: bind() failed, errno=" << errno;
+    return -1;
+  }
+  socklen_t len = sizeof(addr);
+  if (getsockname(fd, (struct sockaddr*)&addr, &len) < 0) {
+    ::close(fd);
+    LOG(ERROR) << "get_free_port: getsockname() failed, errno=" << errno;
+    return -1;
+  }
+  int port = ntohs(addr.sin_port);
+  ::close(fd);
+  return port;
+}
+
 // Compute cosine similarity between item needs vector and bin load vector.
-// Both are normalized to [0,1] by dividing by gpu_hw_spec capacities.
+// HBM is normalized to [0,1] by hw capacity; compute_sm and bandwidth are
+// already per-GPU fractions [0,1] from the GP model.
 // Returns 2.0 (> any valid cosine) if either vector is zero-length.
 static double compute_cos_similarity(
     const ResourceNeeds& needs, const SteadyBin& bin,
     const GpuHardwareSpec& hw) {
-  // Item vector (normalized to [0,1])
+  // Item vector (all in [0,1])
   double v1 = needs.hbm_gb / hw.hbm_per_gpu_gb;
-  double v2 = needs.compute_sm / hw.compute_sm_per_gpu;
-  double v3 = needs.bandwidth / hw.bandwidth_per_gpu;
+  double v2 = needs.compute_sm;   // already [0,1] per GPU
+  double v3 = needs.bandwidth;    // already [0,1] per GPU
 
-  // Bin load vector (normalized): used = capacity - remaining
+  // Bin load vector: used = capacity - remaining
   double s1 = (hw.hbm_per_gpu_gb - bin.remaining_hbm_gb) / hw.hbm_per_gpu_gb;
-  double s2 = (hw.compute_sm_per_gpu - bin.remaining_compute_sm) / hw.compute_sm_per_gpu;
-  double s3 = (hw.bandwidth_per_gpu - bin.remaining_bandwidth) / hw.bandwidth_per_gpu;
+  double s2 = 1.0 - bin.remaining_compute_sm;   // remaining is already [0,1]
+  double s3 = 1.0 - bin.remaining_bandwidth;     // remaining is already [0,1]
 
   double dot = v1 * s1 + v2 * s2 + v3 * s3;
   double norm_v = std::sqrt(v1 * v1 + v2 * v2 + v3 * v3);
@@ -98,7 +132,47 @@ InstanceMgr::InstanceMgr(const Options& options,
   init();
 }
 
+void InstanceMgr::load_models_config() {
+  const std::string& path = FLAGS_models_config_path;
+  LOG(INFO) << "Loading models config from: " << path;
+
+  std::ifstream file(path);
+  if (!file.is_open()) {
+    LOG(FATAL) << "Failed to open models_config_path: " << path;
+    return;
+  }
+
+  nlohmann::json j;
+  try {
+    file >> j;
+  } catch (const std::exception& e) {
+    LOG(FATAL) << "Failed to parse models_config_path JSON (" << path
+               << "): " << e.what();
+    return;
+  }
+
+  if (!j.is_array()) {
+    LOG(FATAL) << "models_config_path JSON must be an array of objects: " << path;
+    return;
+  }
+
+  MODELS.clear();
+  for (const auto& item : j) {
+    if (!item.contains("service") || !item.contains("model_path")) {
+      LOG(FATAL) << "Each entry in models_config_path must have "
+                    "\"service\" and \"model_path\" fields.";
+      return;
+    }
+    MODELS.emplace_back(item["service"].get<std::string>(),
+                        item["model_path"].get<std::string>());
+  }
+
+  LOG(INFO) << "Loaded " << MODELS.size() << " (service, model_path) pairs "
+            << "from " << path;
+}
+
 void InstanceMgr::init() {
+  load_models_config();
   init_model_memory_specs();
   init_model_resource_coefficients();
 
@@ -125,21 +199,23 @@ void InstanceMgr::init() {
     });
   }
 
-  // Start dedicated auto-scaling thread
-  static constexpr int kAutoScalingIntervalMs = 500;
-  auto_scaling_thread_ = std::make_unique<std::thread>([this]() {
-    while (!exited_) {
-      {
-        std::unique_lock<std::mutex> lock(scaling_trigger_mutex_);
-        scaling_trigger_cv_.wait_for(
-            lock, std::chrono::milliseconds(kAutoScalingIntervalMs),
-            [this] { return scaling_requested_ || exited_; });
-        scaling_requested_ = false;
+  // Start dedicated auto-scaling thread (skip if elastic pool disabled)
+  if (!options_.disable_elastic_pool()) {
+    static constexpr int kAutoScalingIntervalMs = 500;
+    auto_scaling_thread_ = std::make_unique<std::thread>([this]() {
+      while (!exited_) {
+        {
+          std::unique_lock<std::mutex> lock(scaling_trigger_mutex_);
+          scaling_trigger_cv_.wait_for(
+              lock, std::chrono::milliseconds(kAutoScalingIntervalMs),
+              [this] { return scaling_requested_ || exited_; });
+          scaling_requested_ = false;
+        }
+        if (exited_) break;
+        try_dynamic_part_auto_scaling();
       }
-      if (exited_) break;
-      try_dynamic_part_auto_scaling();
-    }
-  });
+    });
+  }
 
   // Start low-frequency P/D metrics thread.
   static constexpr int kPdMetricsIntervalSeconds = 1;
@@ -334,6 +410,40 @@ void InstanceMgr::log_model_pd_counts() {
               << " decode=" << decode_count
               << " normal=" << normal_count;
   }
+
+  // --- Orphan cleanup: detect and sleep models stuck in pool=NONE with awake instances ---
+  static constexpr int64_t kOrphanGracePeriodSeconds = 30;
+  for (const auto& [model_id, mgr] : mgrs) {
+    if (!mgr) continue;
+    const auto it = pool_snapshot.find(model_id);
+    const PoolType pool = (it != pool_snapshot.end()) ? it->second : PoolType::NONE;
+    int64_t heat = mgr->get_model_heat();
+    auto awake_instances = mgr->get_awake_instances();
+
+    if (pool == PoolType::NONE && heat == 0 && !awake_instances.empty()) {
+      auto now = std::chrono::steady_clock::now();
+      auto oit = orphan_detected_time_.find(model_id);
+      if (oit == orphan_detected_time_.end()) {
+        orphan_detected_time_[model_id] = now;
+      } else {
+        auto elapsed_s = std::chrono::duration_cast<std::chrono::seconds>(
+            now - oit->second).count();
+        if (elapsed_s >= kOrphanGracePeriodSeconds) {
+          LOG(WARNING) << "Orphan cleanup: model " << model_id
+                       << " has pool=NONE, heat=0 but "
+                       << awake_instances.size()
+                       << " awake instances for >" << elapsed_s
+                       << "s, sleeping them";
+          for (const auto& inst : awake_instances) {
+            send_model_sleep(inst, model_id);
+          }
+          orphan_detected_time_.erase(model_id);
+        }
+      }
+    } else {
+      orphan_detected_time_.erase(model_id);
+    }
+  }
 }
 
 InstanceMetaInfo InstanceMgr::get_instance_info(
@@ -404,66 +514,84 @@ void InstanceMgr::fork_master_and_sleep(
   for (const auto& model : MODELS) {
     // 1. Fork Master
 
-    nlohmann::json fork_body;
-    fork_body["model_path"] = model.second;
-    fork_body["master_node_addr"] = "127.0.0.1:" + std::to_string(++master_node_port);
-    fork_body["master_status"] = 1;
-    fork_body["nnodes"] = kTensorParallelSize;
-    fork_body["disagg_pd_port"] = static_cast<int>(++disagg_pd_port_);
-
     auto model_id = model.first;
 
     /* hardcoded for now */
     int base_port = stoi(instance_name.substr(instance_name.find(":") + 1));
 
-    std::vector<std::thread> fork_threads;
-    std::atomic<int> fork_success_count(0);
-
     LOG(INFO) << "Forking master and sleeping for model " << model_id << " on instance " << instance_name;
 
-    for (int node_idx = 0; node_idx < kTensorParallelSize; ++node_idx) {
-      
-      /* hardcoded for now */
-      int tmp_port = base_port + node_idx;
-      std::string tmp_instance_name = instance_name.substr(0, instance_name.find(":")) +
-                                      ":" + std::to_string(tmp_port);
-      std::shared_ptr<brpc::Channel> tmp_channel = get_channel(tmp_instance_name);
-      if (!tmp_channel) {
-        LOG(ERROR) << "Channel not found for " << tmp_instance_name
-                   << ", skipping fork for model " << model_id;
+    static constexpr int kMaxForkRetries = 10;
+    bool fork_succeeded = false;
+
+    for (int attempt = 0; attempt < kMaxForkRetries && !fork_succeeded; ++attempt) {
+      int master_port = get_free_port();
+      if (master_port < 0) {
+        LOG(ERROR) << "Failed to allocate free port for model " << model_id
+                   << ", attempt " << attempt + 1 << "/" << kMaxForkRetries;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
         continue;
       }
 
-      fork_threads.emplace_back([this, tmp_instance_name, node_idx, fork_body, model_id, tmp_channel, &fork_success_count]() {
-        // send fork request
+      nlohmann::json fork_body;
+      fork_body["model_id"] = model_id;
+      fork_body["model_path"] = model.second;
+      fork_body["master_node_addr"] = "127.0.0.1:" + std::to_string(master_port);
+      fork_body["master_status"] = 1;
+      fork_body["nnodes"] = kTensorParallelSize;
 
-        if (node_idx > 0) {
-          std::this_thread::sleep_for(std::chrono::seconds(2));
+      std::vector<std::thread> fork_threads;
+      std::atomic<int> fork_success_count(0);
+
+      for (int node_idx = 0; node_idx < kTensorParallelSize; ++node_idx) {
+
+        /* hardcoded for now */
+        int tmp_port = base_port + node_idx;
+        std::string tmp_instance_name = instance_name.substr(0, instance_name.find(":")) +
+                                        ":" + std::to_string(tmp_port);
+        std::shared_ptr<brpc::Channel> tmp_channel = get_channel(tmp_instance_name);
+        if (!tmp_channel) {
+          LOG(ERROR) << "Channel not found for " << tmp_instance_name
+                     << ", skipping fork for model " << model_id;
+          continue;
         }
 
-        for (int i = 0; i < 10; ++i) {
+        fork_threads.emplace_back([this, tmp_instance_name, node_idx, fork_body, model_id, tmp_channel, &fork_success_count]() {
+          if (node_idx > 0) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+          }
           if (send_http_request(tmp_channel, "/fork_master", fork_body.dump())) {
             fork_success_count += 1;
-            break;
+          } else {
+            LOG(WARNING) << "Failed to fork master for model " << model_id
+                         << " on " << tmp_instance_name;
           }
-          LOG(WARNING) << "Failed to fork master for model " << model_id << " on "
-                       << tmp_instance_name << ", retry " << i + 1;
-          std::this_thread::sleep_for(std::chrono::seconds(1));
+        });
+      }
+
+      for (auto& t : fork_threads) {
+        if (t.joinable()) {
+          t.join();
         }
+      }
 
-      });
-
-    }
-
-    for (auto& t : fork_threads) {
-      if (t.joinable()) {
-        t.join();
+      if (fork_success_count.load() == kTensorParallelSize) {
+        fork_succeeded = true;
+        LOG(INFO) << "Fork master succeeded for model " << model_id
+                  << " on instance " << instance_name
+                  << " (master_port=" << master_port << ")";
+      } else {
+        LOG(WARNING) << "Fork master failed for model " << model_id
+                     << " on " << instance_name
+                     << " (master_port=" << master_port << "), retry " << attempt + 1
+                     << "/" << kMaxForkRetries;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
       }
     }
 
-    if (fork_success_count.load() != kTensorParallelSize) {
+    if (!fork_succeeded) {
       LOG(ERROR) << "Failed to fork master for model " << model.first << " on "
-                << instance_name << " after retries";
+                << instance_name << " after " << kMaxForkRetries << " retries";
       continue;
     }
 
@@ -1366,13 +1494,13 @@ void InstanceMgr::send_model_sleep(const std::string& instance_name,
   }
 }
 
-void InstanceMgr::send_model_wakeup(const std::string& instance_name,
+bool InstanceMgr::send_model_wakeup(const std::string& instance_name,
                                     const std::string& model_id,
                                     bool memory_increased_in_advance) {
 
   if (instance_name.empty() || instance_name == "all") {
     LOG(ERROR) << "Only support fixed instance_name for model trigger now.";
-    return;
+    return false;
   }
 
   auto model_mgr = get_model_instance_mgr(model_id);
@@ -1433,32 +1561,61 @@ void InstanceMgr::send_model_wakeup(const std::string& instance_name,
     }
     instance_freed_cv_.notify_all();
   }
+  return wakeup_success;
 }
 
 void InstanceMgr::init_model_memory_specs() {
-    // Hardcoded memory specs: x * 2 + 5 GB. 5GB = 3GB KV cache + 2GB overhead
+    // Memory spec per GPU (GB) = weight_bytes / TP / (1024^3) + 5.0 (KV cache + overhead)
+    // Model parameters sourced from janus_data/model_config.py
 
-    // just for test
-    model_memory_specs_["Qwen3-4B"] = 25.0;
-    model_memory_specs_["Qwen2-7B"] = 25.0;
-    model_memory_specs_["Qwen3-8B"] = 25.0;
-    
-
-    // model_memory_specs_["Qwen3-8B"] = 8.0 * 2 + 5.0;// 21.0GB
-    // model_memory_specs_["Qwen2-7B"] = 7.0 * 2 + 5.0;// 19.0GB
-    // model_memory_specs_["Qwen2-7B-Instruct"] = 7.0 * 2 + 5.0;// 19.0GB
-    // model_memory_specs_["Qwen2.5-14B"] = 14.0 * 2 + 5.0;// 33.0GB
-    // model_memory_specs_["Qwen3-4B"] = 4.0 * 2 + 5.0;// 13.0GB
-    // model_memory_specs_["Qwen2.5-3b"] = 3.0 * 2 + 5.0;// 11.0GB
-    // model_memory_specs_["Qwen3-30B-A3B-Instruct-2507"] = 57.0 + 5.0;// 62.0GB
-    // model_memory_specs_["Qwen3-30B-A3B-W8A8"] = 30.0 + 5.0;// 35.0GB
-    // model_memory_specs_["Qwen3-32B-W8A8"] = 40.0 + 5.0;// 45.0GB
+    // Qwen3-0.6B: 0.6B params × bf16 = 1.2 GB, TP=1, per-GPU = 1.2 + 5 = 6.2 GB
+    model_memory_specs_["Qwen3-0.6B"] = 6.2;
+    // Qwen3-1.7B: 1.7B params × bf16 = 3.4 GB, TP=1, per-GPU = 3.4 + 5 = 8.4 GB
+    model_memory_specs_["Qwen3-1.7B"] = 8.4;
+    // Qwen2.5-3B: 3.1B params × bf16 = 6.2 GB, TP=1, per-GPU = 6.2 + 5 = 11.2 GB
+    model_memory_specs_["Qwen2.5-3B"] = 11.2;
+    // Qwen3-4B: 4.0B params × bf16 = 8.0 GB, TP=1, per-GPU = 8.0 + 5 = 13.0 GB
+    model_memory_specs_["Qwen3-4B"] = 13.0;
+    // Qwen2-7B: 7.6B params × bf16 = 15.2 GB, TP=1, per-GPU = 15.2 + 5 = 20.2 GB
+    model_memory_specs_["Qwen2-7B"] = 20.2;
+    // Qwen3-8B: 8.2B params × bf16 = 16.4 GB, TP=1, per-GPU = 16.4 + 5 = 21.4 GB
+    model_memory_specs_["Qwen3-8B"] = 21.4;
+    // Qwen2.5-14B: 14.7B params × bf16 = 29.4 GB, TP=2, per-GPU = 14.7 + 5 = 19.7 GB
+    model_memory_specs_["Qwen2.5-14B"] = 19.7;
+    // Qwen3-32B: 32.8B params × bf16 = 65.6 GB, TP=2, per-GPU = 32.8 + 5 = 37.8 GB
+    model_memory_specs_["Qwen3-32B"] = 37.8;
+    // DeepSeek-V3.2: 671B params × FP8 = 671 GB, TP=16, per-GPU = 41.9 + 5 = 46.9 GB
+    model_memory_specs_["DeepSeek-V3.2"] = 46.9;
+    // GLM-4.5-Air: 112B params × FP8 = 112 GB, TP=16, per-GPU = 7.0 + 5 = 12.0 GB
+    model_memory_specs_["GLM-4.5-Air"] = 12.0;
 }
 
 void InstanceMgr::init_model_resource_coefficients() {
   gpu_hw_spec_.hbm_per_gpu_gb = FLAGS_gpu_hbm_per_gpu_gb;
   gpu_hw_spec_.compute_sm_per_gpu = FLAGS_gpu_compute_sm_per_gpu;
   gpu_hw_spec_.bandwidth_per_gpu = FLAGS_gpu_bandwidth_per_gpu;
+
+  // Load alias-to-real model mapping for GP lookup
+  if (!FLAGS_model_alias_map_path.empty()) {
+    std::ifstream alias_file(FLAGS_model_alias_map_path);
+    if (alias_file.is_open()) {
+      try {
+        nlohmann::json alias_data;
+        alias_file >> alias_data;
+        for (auto it = alias_data.begin(); it != alias_data.end(); ++it) {
+          alias_to_real_model_[it.key()] = it.value().get<std::string>();
+        }
+        LOG(INFO) << "Loaded " << alias_to_real_model_.size()
+                  << " alias-to-real model mappings from "
+                  << FLAGS_model_alias_map_path;
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to parse model alias map: " << e.what();
+      }
+    } else {
+      LOG(ERROR) << "Failed to open model alias map file: "
+                 << FLAGS_model_alias_map_path;
+    }
+  }
 
   // Load GP models from JSON files if paths are provided
   if (!FLAGS_gp_steady_data_path.empty()) {
@@ -1594,8 +1751,13 @@ double InstanceMgr::get_model_memory_size(const std::string& model_id) {
     if (model_memory_specs_.count(model_id)) {
         return model_memory_specs_[model_id];
     }
+    // Resolve alias to real model
+    const std::string& real_model_id = resolve_gp_model_id(model_id);
+    if (real_model_id != model_id && model_memory_specs_.count(real_model_id)) {
+        return model_memory_specs_[real_model_id];
+    }
     LOG(WARNING) << "Unknown model ID for memory spec: " << model_id << ", using default 20GB";
-    return 20.0; 
+    return 20.0;
 }
 
 bool InstanceMgr::is_model_waking_up(const std::string& model_id) {
@@ -1622,9 +1784,10 @@ std::vector<std::string> InstanceMgr::get_awake_prefill_instances(const std::str
 }
 
 void InstanceMgr::update_model_heat(const std::string& model_id,
-                                    int64_t token_count) {
+                                    int64_t token_count,
+                                    int64_t input_len) {
   auto model_mgr = get_model_instance_mgr(model_id);
-  model_mgr->update_model_heat(token_count);
+  model_mgr->update_model_heat(token_count, input_len);
 }
 
 int32_t InstanceMgr::get_wakeup_count(const std::string& model_id) {
@@ -1770,17 +1933,26 @@ void InstanceMgr::request_cold_elastic_wakeup(const std::string& model_id) {
   }
   scaling_trigger_cv_.notify_one();
 
-  // Wait until model has a WAKEUP instance or timeout (10s).
+  // Wait until model has at least 1 PREFILL + 1 DECODE instance in WAKEUP
+  // state (or timeout). A single wakeup_count > 0 is insufficient because
+  // the first instance to finish wakeup may be DECODE-tagged, leaving the
+  // prefill list empty and causing a spurious 503.
   static constexpr int kColdWakeupTimeoutSeconds = 10;
   auto deadline = std::chrono::steady_clock::now() +
                   std::chrono::seconds(kColdWakeupTimeoutSeconds);
   std::unique_lock<std::mutex> lock(model_wakeup_wait_mutex_);
   model_wakeup_cv_.wait_until(lock, deadline, [this, &model_id] {
-    return get_wakeup_count(model_id) > 0 || exited_;
+    return (!get_awake_prefill_instances(model_id).empty() &&
+            !get_awake_decode_instances(model_id).empty()) ||
+           exited_;
   });
 }
 
 void InstanceMgr::dynamic_part_auto_scaling_impl() {
+  if (options_.disable_elastic_pool()) {
+    return;
+  }
+
   int32_t total_gpus = total_available_gpus_.load();
   int32_t raw_budget = std::max(0, total_gpus - steady_needed_gpus());
 
@@ -2288,19 +2460,29 @@ bool InstanceMgr::has_valid_xtensor_info(const std::string& instance_name) {
 }
 
 uint64_t InstanceMgr::get_model_size_bytes(const std::string& model_id) {
-  // Priority 1: Get from any instance's xtensor info
+  // Resolve alias to real model for lookup
+  const std::string& real_model_id = resolve_gp_model_id(model_id);
+
+  // Priority 1: Get from any instance's xtensor info (try both alias and real)
   {
     std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
     for (const auto& [inst_name, info] : instance_xtensor_infos_) {
       if (!info.is_valid) continue;
       uint64_t size = info.get_model_size_bytes(model_id);
       if (size > 0) return size;
+      if (real_model_id != model_id) {
+        size = info.get_model_size_bytes(real_model_id);
+        if (size > 0) return size;
+      }
     }
   }
 
-  // Priority 2: Fallback to model_memory_specs_
+  // Priority 2: Fallback to model_memory_specs_ (try both alias and real)
   if (model_memory_specs_.count(model_id)) {
     return static_cast<uint64_t>(model_memory_specs_[model_id] * 1024 * 1024 * 1024);
+  }
+  if (real_model_id != model_id && model_memory_specs_.count(real_model_id)) {
+    return static_cast<uint64_t>(model_memory_specs_[real_model_id] * 1024 * 1024 * 1024);
   }
 
   // Default fallback: 20GB
@@ -2545,14 +2727,43 @@ int32_t InstanceMgr::compute_elastic_gpu_target_from_rate(double avg_token_rate)
 
 ResourceNeeds InstanceMgr::get_model_resource_needs(const std::string& model_id) {
   auto model_mgr = get_model_instance_mgr(model_id);
-  int64_t heat = model_mgr ? model_mgr->get_model_heat() : 0;
+  auto stats = model_mgr ? model_mgr->get_traffic_stats()
+                         : ModelInstanceMgr::TrafficStats{};
 
-  auto it = model_resource_models_.find(model_id);
+  const auto& gp_id = resolve_gp_model_id(model_id);
+  auto it = model_resource_models_.find(gp_id);
   if (it != model_resource_models_.end()) {
-    return it->second->compute_resource_needs(heat);
+    return it->second->calc_3d_resources(
+        stats.token_rate, stats.avg_input_len,
+        stats.avg_input_len2, stats.avg_output_len);
   }
   // Default: use hbm_b=20GB, compute_b=0, bandwidth=0 for unknown models
   return {20.0, 0.0, 0.0};
+}
+
+int32_t InstanceMgr::compute_gpu_target_for_model(const std::string& model_id) {
+  auto model_mgr = get_model_instance_mgr(model_id);
+  if (!model_mgr) return 1;
+
+  auto stats = model_mgr->get_traffic_stats();
+  if (stats.token_rate <= 0.0) return 1;
+
+  const auto& gp_id = resolve_gp_model_id(model_id);
+  auto it = model_resource_models_.find(gp_id);
+  if (it == model_resource_models_.end()) return 1;
+
+  ResourceNeeds needs = it->second->calc_3d_resources(
+      stats.token_rate, stats.avg_input_len,
+      stats.avg_input_len2, stats.avg_output_len);
+
+  // HBM needs normalization; compute_sm and bandwidth are already [0,1] per GPU
+  double hbm_gpus = needs.hbm_gb / gpu_hw_spec_.hbm_per_gpu_gb;
+  double compute_gpus = needs.compute_sm;
+  double bandwidth_gpus = needs.bandwidth;
+
+  int32_t target = static_cast<int32_t>(
+      std::ceil(std::max({hbm_gpus, compute_gpus, bandwidth_gpus})));
+  return std::max(target, 1);
 }
 
 void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
@@ -2578,21 +2789,50 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     return;
   }
 
-  int64_t heat = model_mgr->get_model_heat();
-  auto res_it = model_resource_models_.find(model_id);
-  int32_t gpu_target = (heat == 0) ? 1
-      : (res_it != model_resource_models_.end())
-          ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
-          : 1;
+  // When elastic pool is disabled, force steady pool assignment
+  if (options_.disable_elastic_pool()) {
+    ResourceNeeds needs = get_model_resource_needs(model_id);
+    std::string instance = find_or_create_steady_bin(model_id, needs);
+    if (instance.empty()) {
+      LOG(WARNING) << "assign_model_to_pool: no instance for steady pool, "
+                   << "model " << model_id << " unassigned (elastic disabled)";
+      return;
+    }
+
+    model_pool_assignments_[model_id] = PoolType::STEADY;
+    uint64_t model_size = get_model_size_bytes(model_id);
+    model_mgr->set_model_state(instance, ModelState::ALLOCATED);
+    deduct_free_pages(instance, model_size);
+    {
+      std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+      instance_tag_map_[instance] = InstanceTag::NORMAL;
+      LOG(INFO) << "Tag change: instance " << instance
+                << " -> NORMAL (steady assign, elastic pool disabled, model "
+                << model_id << ")";
+    }
+
+    alloc_lock.unlock();
+    send_model_wakeup(instance, model_id, true);
+
+    LOG(INFO) << "assign_model_to_pool: model=" << model_id
+              << " -> STEADY on " << instance << " (elastic pool disabled)";
+    return;
+  }
+
+  // Use token rate threshold to decide pool: if rate exceeds single-instance
+  // capacity (3000 tok/s), the model needs elastic pool with multiple instances.
+  static constexpr double kSingleInstanceCapacity = 3000.0;
+  auto stats = model_mgr->get_traffic_stats();
+  bool needs_elastic = stats.token_rate > kSingleInstanceCapacity;
 
   LOG(INFO) << "assign_model_to_pool: model=" << model_id
-            << " heat=" << heat << " gpu_target=" << gpu_target;
+            << " token_rate=" << stats.token_rate
+            << " threshold=" << kSingleInstanceCapacity
+            << " -> " << (needs_elastic ? "ELASTIC" : "STEADY");
 
-  if (gpu_target <= 1) {
+  if (!needs_elastic) {
     // Steady pool
-    ResourceNeeds needs = (res_it != model_resource_models_.end())
-        ? res_it->second->compute_resource_needs(heat)
-        : ResourceNeeds{20.0, 0.0, 0.0};
+    ResourceNeeds needs = get_model_resource_needs(model_id);
 
     std::string instance = find_or_create_steady_bin(model_id, needs);
     if (instance.empty()) {
@@ -2631,9 +2871,7 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
                 << model_id << " (free=" << free_for_elastic
                 << " < 2), falling back to STEADY";
 
-      ResourceNeeds needs = (res_it != model_resource_models_.end())
-          ? res_it->second->compute_resource_needs(heat)
-          : ResourceNeeds{20.0, 0.0, 0.0};
+      ResourceNeeds needs = get_model_resource_needs(model_id);
 
       std::string instance = find_or_create_steady_bin(model_id, needs);
       if (instance.empty()) {
@@ -2663,7 +2901,7 @@ void InstanceMgr::assign_model_to_pool(const std::string& model_id) {
     } else {
       model_pool_assignments_[model_id] = PoolType::ELASTIC;
       LOG(INFO) << "Assigned model " << model_id
-                << " to ELASTIC pool (gpu_target=" << gpu_target << ")";
+                << " to ELASTIC pool";
     }
   }
 }
@@ -2710,9 +2948,18 @@ std::string InstanceMgr::find_or_create_steady_bin(
       if (get_instance_tag(inst_name) != InstanceTag::NONE) continue;
       if (!has_valid_xtensor_info(inst_name)) continue;
 
+      uint64_t free_bytes = get_instance_free_bytes(inst_name);
+      double free_gb = static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0);
+      if (free_gb < needs.hbm_gb) {
+        LOG(INFO) << "find_or_create_steady_bin: skip " << inst_name
+                  << " for model " << model_id << " (free=" << free_gb
+                  << "GB < need=" << needs.hbm_gb << "GB)";
+        continue;
+      }
+
       SteadyBin new_bin;
       new_bin.instance_name = inst_name;
-      new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - needs.hbm_gb;
+      new_bin.remaining_hbm_gb = free_gb - needs.hbm_gb;
       new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - needs.compute_sm;
       new_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu - needs.bandwidth;
       new_bin.models.insert(model_id);
@@ -2756,9 +3003,18 @@ std::string InstanceMgr::find_or_create_steady_bin(
       if (get_instance_tag(inst_name) != InstanceTag::NONE) continue;
       if (!has_valid_xtensor_info(inst_name)) continue;
 
+      uint64_t free_bytes = get_instance_free_bytes(inst_name);
+      double free_gb = static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0);
+      if (free_gb < needs.hbm_gb) {
+        LOG(INFO) << "find_or_create_steady_bin (reclaim): skip " << inst_name
+                  << " for model " << model_id << " (free=" << free_gb
+                  << "GB < need=" << needs.hbm_gb << "GB)";
+        continue;
+      }
+
       SteadyBin new_bin;
       new_bin.instance_name = inst_name;
-      new_bin.remaining_hbm_gb = gpu_hw_spec_.hbm_per_gpu_gb - needs.hbm_gb;
+      new_bin.remaining_hbm_gb = free_gb - needs.hbm_gb;
       new_bin.remaining_compute_sm = gpu_hw_spec_.compute_sm_per_gpu - needs.compute_sm;
       new_bin.remaining_bandwidth = gpu_hw_spec_.bandwidth_per_gpu - needs.bandwidth;
       new_bin.models.insert(model_id);
@@ -2874,6 +3130,9 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   if (options_.disable_steady_pool()) {
     return false;
   }
+  if (options_.disable_elastic_pool()) {
+    return false;
+  }
 
   std::unique_lock<std::mutex> alloc_lock(allocation_mutex_);
 
@@ -2886,13 +3145,10 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
   auto model_mgr = get_model_instance_mgr(model_id);
   if (!model_mgr) return false;
 
-  int64_t heat = model_mgr->get_model_heat();
-  auto res_it = model_resource_models_.find(model_id);
-  int32_t gpu_target = (res_it != model_resource_models_.end())
-      ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
-      : 1;
-
-  if (gpu_target <= 1) {
+  // Use token rate threshold (same as assign_model_to_pool)
+  static constexpr double kSingleInstanceCapacity = 3000.0;
+  auto stats = model_mgr->get_traffic_stats();
+  if (stats.token_rate <= kSingleInstanceCapacity) {
     return false;  // still fits in steady pool
   }
 
@@ -2934,8 +3190,7 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
 
   alloc_lock.unlock();
 
-  LOG(INFO) << "Upgrading model " << model_id << " from STEADY to ELASTIC pool "
-            << "(gpu_target=" << gpu_target << ")";
+  LOG(INFO) << "Upgrading model " << model_id << " from STEADY to ELASTIC pool ";
 
   // Async: drain + sleep the model on old steady instance
   if (!steady_instance.empty()) {
@@ -2964,7 +3219,21 @@ bool InstanceMgr::steady_part_check_upgrading(const std::string& model_id) {
       LOG(INFO) << "Tag change: instance " << new_inst
                 << " -> NORMAL (R(B) repack for model " << mid << ")";
     }
-    send_model_wakeup(new_inst, mid, false);
+    bool wakeup_ok = send_model_wakeup(new_inst, mid, false);
+    if (!wakeup_ok) {
+      LOG(WARNING) << "R(B) repack: wakeup failed for " << mid
+                   << " on " << new_inst
+                   << ", rolling back and keeping old instance " << old_inst;
+      // Roll back new instance state
+      if (mgr) {
+        mgr->set_model_state(new_inst, ModelState::SLEEP);
+      }
+      if (count_active_models_on_instance(new_inst) == 0) {
+        std::unique_lock<std::shared_mutex> lock(tag_mutex_);
+        instance_tag_map_[new_inst] = InstanceTag::NONE;
+      }
+      continue;
+    }
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
     wait_for_model_drain(old_inst, mid);
     send_model_sleep(old_inst, mid);
@@ -3069,6 +3338,14 @@ InstanceMgr::repack_steady_bins() {
         for (const auto& [name, _] : instances_) {
           if (elastic_occupied_instances_.count(name)) continue;
           if (!has_valid_xtensor_info(name)) continue;
+          uint64_t free_bytes = get_instance_free_bytes(name);
+          double free_gb = static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0);
+          if (free_gb < item.needs.hbm_gb) {
+            LOG(INFO) << "repack_steady_bins: skip " << name
+                      << " for model " << item.model_id << " (free=" << free_gb
+                      << "GB < need=" << item.needs.hbm_gb << "GB)";
+            continue;
+          }
           // Check not already used in new_bins
           bool already_used = false;
           for (const auto& nb : new_bins) {
@@ -3140,13 +3417,20 @@ void InstanceMgr::steady_part_auto_repacking() {
   for (const auto& [model_id, instance] : models_to_remove) {
     remove_model_from_steady_bin(model_id);
     model_pool_assignments_.erase(model_id);
-    LOG(INFO) << "steady_part_auto_repacking: sleeping model " << model_id
-              << " on " << instance << " (heat=0)";
-    std::string inst = instance;
-    std::string mid = model_id;
-    std::thread([this, inst, mid]() {
-      send_model_sleep(inst, mid);
-    }).detach();
+    // Query actual awake instances (bin instance may be stale after cascading repacks)
+    auto model_mgr = get_model_instance_mgr(model_id);
+    if (model_mgr) {
+      auto awake_insts = model_mgr->get_awake_instances();
+      for (const auto& awake_inst : awake_insts) {
+        LOG(INFO) << "steady_part_auto_repacking: sleeping model " << model_id
+                  << " on " << awake_inst << " (heat=0)";
+        std::string inst_copy = awake_inst;
+        std::string mid = model_id;
+        std::thread([this, inst_copy, mid]() {
+          send_model_sleep(inst_copy, mid);
+        }).detach();
+      }
+    }
   }
 
   // Phase 2: FFD repack of remaining models
@@ -3169,7 +3453,13 @@ void InstanceMgr::steady_part_auto_repacking() {
       LOG(INFO) << "Tag change: instance " << new_inst
                 << " -> NORMAL (steady repack for model " << model_id << ")";
     }
-    send_model_wakeup(new_inst, model_id, false);
+    bool wakeup_ok = send_model_wakeup(new_inst, model_id, false);
+    if (!wakeup_ok) {
+      LOG(WARNING) << "steady_part_auto_repacking: wakeup failed for "
+                   << model_id << " on " << new_inst
+                   << ", keeping old instance " << old_inst;
+      continue;
+    }
     if (mgr) mgr->set_model_state(old_inst, ModelState::DRAINING);
     wait_for_model_drain(old_inst, model_id);
     send_model_sleep(old_inst, model_id);
@@ -3178,6 +3468,9 @@ void InstanceMgr::steady_part_auto_repacking() {
 
 void InstanceMgr::elastic_to_steady_demotion() {
   if (options_.disable_steady_pool()) {
+    return;
+  }
+  if (options_.disable_elastic_pool()) {
     return;
   }
 
@@ -3205,12 +3498,9 @@ void InstanceMgr::elastic_to_steady_demotion() {
       auto model_mgr = get_model_instance_mgr(model_id);
       if (!model_mgr) continue;
 
-      int64_t heat = model_mgr->get_model_heat();
-      auto res_it = model_resource_models_.find(model_id);
-      int32_t gpu_target = (heat == 0) ? 0
-          : (res_it != model_resource_models_.end())
-              ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
-              : 1;
+      int32_t gpu_target = compute_gpu_target_for_model(model_id);
+      // treat zero-rate as 0 target (model is idle)
+      if (model_mgr->get_model_heat() == 0) gpu_target = 0;
 
       if (gpu_target != 1) {
         // Demand is not "low but nonzero" — reset tracking
@@ -3251,12 +3541,8 @@ void InstanceMgr::elastic_to_steady_demotion() {
       continue;
     }
 
-    int64_t heat = model_mgr->get_model_heat();
-    auto res_it = model_resource_models_.find(model_id);
-    int32_t gpu_target = (heat == 0) ? 0
-        : (res_it != model_resource_models_.end())
-            ? res_it->second->compute_gpu_target(heat, gpu_hw_spec_)
-            : 1;
+    int32_t gpu_target = compute_gpu_target_for_model(model_id);
+    if (model_mgr->get_model_heat() == 0) gpu_target = 0;
     if (gpu_target != 1) {
       elastic_low_demand_since_.erase(model_id);
       continue;
