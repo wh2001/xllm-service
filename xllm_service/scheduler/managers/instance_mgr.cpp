@@ -25,6 +25,8 @@ limitations under the License.
 
 #include <chrono>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <thread>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -44,9 +46,10 @@ limitations under the License.
 
 namespace xllm_service {
 
-// Obtain a free port from the OS by binding to port 0.
-// Returns -1 on failure.
-static int get_free_port() {
+// DEPRECATED: Local port probe is unreliable for remote xllm instances
+// (TOCTOU race + cross-machine invalidity).  Replaced by
+// InstanceMgr::request_free_port() which queries the target machine.
+[[maybe_unused]] static int get_free_port() {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
     LOG(ERROR) << "get_free_port: socket() failed, errno=" << errno;
@@ -172,6 +175,14 @@ void InstanceMgr::load_models_config() {
 }
 
 void InstanceMgr::init() {
+  // Truncate log files at startup so each run starts fresh.
+  for (const auto& path :
+       {FLAGS_pool_memory_log_path, FLAGS_check_memory_log_path}) {
+    if (!path.empty()) {
+      std::ofstream(path, std::ios::trunc);
+    }
+  }
+
   load_models_config();
   init_model_memory_specs();
   init_model_resource_coefficients();
@@ -220,6 +231,7 @@ void InstanceMgr::init() {
   // Start low-frequency P/D metrics thread.
   static constexpr int kPdMetricsIntervalSeconds = 1;
   static constexpr int kInstanceMetricsIntervalTicks = 60;
+  static constexpr int kPoolMemoryStatsIntervalTicks = 10;
   pd_metrics_thread_ = std::make_unique<std::thread>([this]() {
     int tick = 0;
     while (!exited_) {
@@ -227,11 +239,15 @@ void InstanceMgr::init() {
           std::chrono::seconds(kPdMetricsIntervalSeconds));
       if (exited_) break;
       ++tick;
+      if (tick % kPoolMemoryStatsIntervalTicks == 0) {
+        log_pool_memory_stats();
+      }
       if (tick >= kInstanceMetricsIntervalTicks) {
         log_instance_counts();
         tick = 0;
       }
       log_model_pd_counts();
+      log_xtensor_heartbeat_details();
     }
   });
 
@@ -351,6 +367,305 @@ void InstanceMgr::log_instance_counts() {
   LOG(INFO) << "Instance metrics: registered=" << registered
             << " pending=" << pending
             << " total=" << (registered + pending);
+}
+
+void InstanceMgr::log_pool_memory_stats() {
+  // 1. Snapshot allocation state (allocation_mutex_ is outermost in hierarchy).
+  std::vector<std::string> steady_instance_names;
+  std::unordered_set<std::string> elastic_instance_names;
+  {
+    std::lock_guard<std::mutex> lock(allocation_mutex_);
+    for (const auto& bin : steady_bins_) {
+      steady_instance_names.push_back(bin.instance_name);
+    }
+    elastic_instance_names = elastic_occupied_instances_;
+  }
+
+  // 2. Snapshot XTensor info (xtensor_info_mutex_ is below allocation_mutex_).
+  std::unordered_map<std::string, InstanceXTensorInfo> xtensor_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+    xtensor_snapshot = instance_xtensor_infos_;
+  }
+
+  // 3. Total registered instance count.
+  int total_registered = 0;
+  {
+    std::shared_lock<std::shared_mutex> lock(inst_mutex_);
+    total_registered = static_cast<int>(instances_.size());
+  }
+
+  const int steady_instances = static_cast<int>(steady_instance_names.size());
+  const int steady_gpus = steady_instances * kTensorParallelSize;
+  const int elastic_instances = static_cast<int>(elastic_instance_names.size());
+  const int elastic_gpus = elastic_instances * kTensorParallelSize;
+
+  // 4. Compute per-pool GPU memory utilization from XTensor heartbeat data.
+  const double total_hbm_per_gpu_bytes =
+      gpu_hw_spec_.hbm_per_gpu_gb * 1024.0 * 1024.0 * 1024.0;
+
+  uint64_t all_used_bytes = 0;
+  int all_gpu_count = 0;
+
+  uint64_t steady_used_bytes = 0;
+  int steady_gpu_count = 0;
+
+  uint64_t elastic_used_bytes = 0;
+  int elastic_gpu_count = 0;
+
+  const std::unordered_set<std::string> steady_set(
+      steady_instance_names.begin(), steady_instance_names.end());
+
+  for (const auto& [inst_name, info] : xtensor_snapshot) {
+    if (!info.is_valid) continue;
+
+    const bool is_steady = steady_set.count(inst_name) > 0;
+    const bool is_elastic = elastic_instance_names.count(inst_name) > 0;
+
+    for (uint64_t free_pages : info.worker_free_phy_pages) {
+      const uint64_t free_bytes = free_pages * kXTensorPageSizeBytes;
+      const uint64_t used =
+          (total_hbm_per_gpu_bytes > free_bytes)
+              ? static_cast<uint64_t>(total_hbm_per_gpu_bytes) - free_bytes
+              : 0;
+      all_used_bytes += used;
+      ++all_gpu_count;
+
+      if (is_steady) {
+        steady_used_bytes += used;
+        ++steady_gpu_count;
+      } else if (is_elastic) {
+        elastic_used_bytes += used;
+        ++elastic_gpu_count;
+      }
+    }
+  }
+
+  auto to_gb = [](uint64_t bytes) {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+  };
+
+  const double total_used_gb = to_gb(all_used_bytes);
+  const double steady_avg_gb =
+      (steady_gpu_count > 0) ? to_gb(steady_used_bytes) / steady_gpu_count
+                             : 0.0;
+  const double elastic_avg_gb =
+      (elastic_gpu_count > 0) ? to_gb(elastic_used_bytes) / elastic_gpu_count
+                              : 0.0;
+
+  const double hbm = gpu_hw_spec_.hbm_per_gpu_gb;
+  const double steady_util_pct =
+      (hbm > 0.0 && steady_gpu_count > 0) ? steady_avg_gb / hbm * 100.0
+                                           : 0.0;
+  const double elastic_util_pct =
+      (hbm > 0.0 && elastic_gpu_count > 0) ? elastic_avg_gb / hbm * 100.0
+                                            : 0.0;
+  const double overall_util_pct =
+      (hbm > 0.0 && all_gpu_count > 0)
+          ? to_gb(all_used_bytes) / all_gpu_count / hbm * 100.0
+          : 0.0;
+
+  // 5. Format timestamp.
+  auto now = std::chrono::system_clock::now();
+  auto time_t_now = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) % 1000;
+  std::tm tm_buf;
+  localtime_r(&time_t_now, &tm_buf);
+
+  std::ostringstream ts;
+  ts << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S") << '.'
+     << std::setfill('0') << std::setw(3) << ms.count();
+
+  // 6. Build log lines.
+  std::ostringstream line1;
+  line1 << "[" << ts.str() << "] "
+        << "Pool allocation: total_registered=" << total_registered
+        << " steady_instances=" << steady_instances
+        << " steady_gpus=" << steady_gpus
+        << " elastic_instances=" << elastic_instances
+        << " elastic_gpus=" << elastic_gpus;
+
+  std::ostringstream line2;
+  line2 << "[" << ts.str() << "] "
+        << "Pool memory: total_used_gb=" << std::fixed << std::setprecision(2)
+        << total_used_gb
+        << " gpus_with_data=" << all_gpu_count
+        << " overall_util=" << overall_util_pct << "%"
+        << " steady_avg_per_gpu_gb=" << steady_avg_gb
+        << " steady_util=" << steady_util_pct << "%"
+        << " (gpus=" << steady_gpu_count << ")"
+        << " elastic_avg_per_gpu_gb=" << elastic_avg_gb
+        << " elastic_util=" << elastic_util_pct << "%"
+        << " (gpus=" << elastic_gpu_count << ")"
+        << " hbm_per_gpu_gb=" << hbm;
+
+  // 7. Output: dedicated file if configured, otherwise glog.
+  if (!FLAGS_pool_memory_log_path.empty()) {
+    std::ofstream ofs(FLAGS_pool_memory_log_path, std::ios::app);
+    if (ofs.is_open()) {
+      ofs << line1.str() << "\n" << line2.str() << "\n";
+    } else {
+      LOG(WARNING) << "Failed to open pool_memory_log_path: "
+                   << FLAGS_pool_memory_log_path;
+      LOG(INFO) << line1.str();
+      LOG(INFO) << line2.str();
+    }
+  } else {
+    LOG(INFO) << line1.str();
+    LOG(INFO) << line2.str();
+  }
+}
+
+void InstanceMgr::log_xtensor_heartbeat_details() {
+  if (FLAGS_check_memory_log_path.empty()) return;
+
+  // 1. Snapshot XTensor info.
+  std::unordered_map<std::string, InstanceXTensorInfo> xtensor_snapshot;
+  {
+    std::lock_guard<std::mutex> lock(xtensor_info_mutex_);
+    xtensor_snapshot = instance_xtensor_infos_;
+  }
+
+  if (xtensor_snapshot.empty()) return;
+
+  // 2. Snapshot pool assignments.
+  std::unordered_set<std::string> steady_names;
+  std::unordered_set<std::string> elastic_names;
+  {
+    std::lock_guard<std::mutex> lock(allocation_mutex_);
+    for (const auto& bin : steady_bins_) {
+      steady_names.insert(bin.instance_name);
+    }
+    elastic_names = elastic_occupied_instances_;
+  }
+
+  // 3. Format timestamp.
+  auto now = std::chrono::system_clock::now();
+  auto time_t_now = std::chrono::system_clock::to_time_t(now);
+  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch()) % 1000;
+  std::tm tm_buf;
+  localtime_r(&time_t_now, &tm_buf);
+
+  std::ostringstream ts;
+  ts << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S") << '.'
+     << std::setfill('0') << std::setw(3) << ms.count();
+
+  const double total_hbm_per_gpu_bytes =
+      gpu_hw_spec_.hbm_per_gpu_gb * 1024.0 * 1024.0 * 1024.0;
+
+  auto to_gb = [](uint64_t bytes) -> double {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+  };
+  auto to_mb = [](uint64_t bytes) -> double {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+  };
+
+  // 4. Build detailed log.
+  std::ostringstream oss;
+  oss << "========== XTensor Heartbeat Details [" << ts.str()
+      << "] instances=" << xtensor_snapshot.size()
+      << " hbm_per_gpu=" << std::fixed << std::setprecision(2)
+      << gpu_hw_spec_.hbm_per_gpu_gb << "GB ==========\n";
+
+  // Sort instance names for stable output.
+  std::vector<std::string> sorted_names;
+  sorted_names.reserve(xtensor_snapshot.size());
+  for (const auto& [name, _] : xtensor_snapshot) {
+    sorted_names.push_back(name);
+  }
+  std::sort(sorted_names.begin(), sorted_names.end());
+
+  for (const auto& inst_name : sorted_names) {
+    const auto& info = xtensor_snapshot.at(inst_name);
+
+    const char* pool = "UNASSIGNED";
+    if (steady_names.count(inst_name)) pool = "STEADY";
+    else if (elastic_names.count(inst_name)) pool = "ELASTIC";
+
+    oss << "  [Instance] " << inst_name
+        << "  pool=" << pool
+        << "  valid=" << (info.is_valid ? "true" : "false") << "\n";
+
+    if (!info.is_valid) {
+      oss << "    (no valid heartbeat data)\n";
+      continue;
+    }
+
+    // Per-worker free pages.
+    oss << "    Workers(" << info.worker_free_phy_pages.size() << "):";
+    for (size_t w = 0; w < info.worker_free_phy_pages.size(); ++w) {
+      uint64_t free_pages = info.worker_free_phy_pages[w];
+      uint64_t free_bytes = free_pages * kXTensorPageSizeBytes;
+      uint64_t used_bytes =
+          (total_hbm_per_gpu_bytes > free_bytes)
+              ? static_cast<uint64_t>(total_hbm_per_gpu_bytes) - free_bytes
+              : 0;
+      double util_pct = (total_hbm_per_gpu_bytes > 0)
+          ? static_cast<double>(used_bytes) / total_hbm_per_gpu_bytes * 100.0
+          : 0.0;
+      oss << "  [rank" << w
+          << " free_pages=" << free_pages
+          << " free=" << std::fixed << std::setprecision(2) << to_gb(free_bytes) << "GB"
+          << " used=" << to_gb(used_bytes) << "GB"
+          << " util=" << std::setprecision(1) << util_pct << "%]";
+    }
+    oss << "\n";
+
+    // Aggregate: min free across workers.
+    uint64_t min_free = info.get_min_free_bytes();
+    oss << "    MinFreeAcrossWorkers: " << std::setprecision(2)
+        << to_gb(min_free) << "GB (" << min_free << " bytes)\n";
+
+    // Loaded models and weight segments.
+    if (info.model_weight_segments.empty()) {
+      oss << "    Models: (none loaded)\n";
+    } else {
+      oss << "    Models(" << info.model_weight_segments.size() << "):\n";
+      for (const auto& [model_id, segments] : info.model_weight_segments) {
+        uint64_t total_model_bytes = 0;
+        for (const auto& seg : segments) {
+          total_model_bytes += seg.size;
+        }
+        oss << "      model_id=\"" << model_id
+            << "\"  segments=" << segments.size()
+            << "  total_size=" << to_mb(total_model_bytes) << "MB ("
+            << to_gb(total_model_bytes) << "GB)\n";
+        for (size_t s = 0; s < segments.size(); ++s) {
+          oss << "        seg[" << s
+              << "] offset=" << segments[s].offset
+              << " size=" << segments[s].size
+              << " (" << to_mb(segments[s].size) << "MB)"
+              << " end=" << segments[s].end() << "\n";
+        }
+      }
+    }
+
+    // Device & P2P addresses (for D2D context).
+    if (!info.device_addrs.empty()) {
+      oss << "    DeviceAddrs:";
+      for (const auto& addr : info.device_addrs) oss << " " << addr;
+      oss << "\n";
+    }
+    if (!info.p2p_addrs.empty()) {
+      oss << "    P2PAddrs:";
+      for (const auto& addr : info.p2p_addrs) oss << " " << addr;
+      oss << "\n";
+    }
+  }
+
+  oss << "========== End XTensor Heartbeat Details ==========\n";
+
+  // 5. Write to file.
+  std::ofstream ofs(FLAGS_check_memory_log_path, std::ios::app);
+  if (ofs.is_open()) {
+    ofs << oss.str();
+  } else {
+    LOG(WARNING) << "Failed to open check_memory_log_path: "
+                 << FLAGS_check_memory_log_path;
+    LOG(INFO) << oss.str();
+  }
 }
 
 void InstanceMgr::log_model_pd_counts() {
@@ -525,9 +840,12 @@ void InstanceMgr::fork_master_and_sleep(
     bool fork_succeeded = false;
 
     for (int attempt = 0; attempt < kMaxForkRetries && !fork_succeeded; ++attempt) {
-      int master_port = get_free_port();
+      // Allocate port on node 0's machine (the one that binds CollectiveServer).
+      // For TP=1 this is the only node; for TP>1 it is the base instance.
+      int master_port = request_free_port(channel);
       if (master_port < 0) {
-        LOG(ERROR) << "Failed to allocate free port for model " << model_id
+        LOG(ERROR) << "Failed to get free port from remote " << instance_name
+                   << " for model " << model_id
                    << ", attempt " << attempt + 1 << "/" << kMaxForkRetries;
         std::this_thread::sleep_for(std::chrono::seconds(1));
         continue;
@@ -560,7 +878,9 @@ void InstanceMgr::fork_master_and_sleep(
           if (node_idx > 0) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
           }
-          if (send_http_request(tmp_channel, "/fork_master", fork_body.dump())) {
+          static constexpr int kForkTimeoutMs = 120000;
+          if (send_http_request(tmp_channel, "/fork_master",
+                                fork_body.dump(), kForkTimeoutMs)) {
             fork_success_count += 1;
           } else {
             LOG(WARNING) << "Failed to fork master for model " << model_id
@@ -584,7 +904,8 @@ void InstanceMgr::fork_master_and_sleep(
         LOG(WARNING) << "Fork master failed for model " << model_id
                      << " on " << instance_name
                      << " (master_port=" << master_port << "), retry " << attempt + 1
-                     << "/" << kMaxForkRetries;
+                     << "/" << kMaxForkRetries
+                     << " (will request new port from remote)";
         std::this_thread::sleep_for(std::chrono::seconds(1));
       }
     }
@@ -686,12 +1007,16 @@ bool InstanceMgr::send_http_request(const std::string& instance_name,
 
 bool InstanceMgr::send_http_request(std::shared_ptr<brpc::Channel> channel,
                                     const std::string& uri,
-                                    const std::string& request_body) {
+                                    const std::string& request_body,
+                                    int timeout_ms) {
   brpc::Controller cntl;
   cntl.http_request().uri() = uri;  // brpc channel already has host:port
   cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
   cntl.http_request().set_content_type("application/json");
   cntl.request_attachment().append(request_body);
+  if (timeout_ms > 0) {
+    cntl.set_timeout_ms(timeout_ms);
+  }
 
   channel->CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
 
@@ -700,6 +1025,33 @@ bool InstanceMgr::send_http_request(std::shared_ptr<brpc::Channel> channel,
     return false;
   }
   return true;
+}
+
+int InstanceMgr::request_free_port(std::shared_ptr<brpc::Channel> channel) {
+  brpc::Controller cntl;
+  cntl.http_request().uri() = "/get_free_port";
+  cntl.http_request().set_method(brpc::HTTP_METHOD_GET);
+  cntl.set_timeout_ms(5000);
+
+  channel->CallMethod(nullptr, &cntl, nullptr, nullptr, nullptr);
+
+  if (cntl.Failed()) {
+    LOG(ERROR) << "request_free_port RPC failed: " << cntl.ErrorText();
+    return -1;
+  }
+
+  try {
+    auto body = cntl.response_attachment().to_string();
+    auto resp = nlohmann::json::parse(body);
+    int port = resp.value("port", -1);
+    if (port <= 0) {
+      LOG(ERROR) << "Remote returned invalid port: " << body;
+    }
+    return port;
+  } catch (const std::exception& e) {
+    LOG(ERROR) << "Failed to parse get_free_port response: " << e.what();
+    return -1;
+  }
 }
 
 void InstanceMgr::get_load_metrics(LoadBalanceInfos* infos) {
@@ -1875,6 +2227,10 @@ bool InstanceMgr::should_accept_scaling_plan(
     }
   }
 
+  return true;
+
+
+
   // Rule 4: Direction reversal detection via dot product.
   //         If dot(now - last, new - now) < 0 and elapsed < 5s — reject.
   if (!last_scaling_plan_.empty() && elapsed_sec < 5.0) {
@@ -2257,22 +2613,26 @@ void InstanceMgr::dynamic_part_auto_scaling_impl() {
   }
 
   // Phase B: Greedy matching — pair scale-up needs with scale-down candidates
-  // Best fit: smallest free_bytes >= model_size (can hold both models at once)
+  // Best fit: smallest free_bytes >= model_size + abundance (can hold both models at once)
   struct OverlapMatch {
     size_t up_idx;
     size_t down_idx;
   };
   std::vector<OverlapMatch> overlapped_matches;
 
+  const uint64_t overlap_abundance_bytes =
+      static_cast<uint64_t>(FLAGS_overlap_abundance_gb * 1024 * 1024 * 1024);
+
   for (size_t u = 0; u < scale_up_needs.size(); ++u) {
     auto& up = scale_up_needs[u];
     int best_idx = -1;
     uint64_t best_free = UINT64_MAX;
+    const uint64_t required_bytes = up.model_size + overlap_abundance_bytes;
     for (size_t k = 0; k < scale_down_candidates.size(); ++k) {
       if (scale_down_candidates[k].matched) continue;
       uint64_t free_bytes =
           get_instance_free_bytes(scale_down_candidates[k].instance_name);
-      if (free_bytes >= up.model_size && free_bytes < best_free) {
+      if (free_bytes >= required_bytes && free_bytes < best_free) {
         best_free = free_bytes;
         best_idx = static_cast<int>(k);
       }
@@ -2913,10 +3273,15 @@ std::string InstanceMgr::find_or_create_steady_bin(
   // Phase 1: min cos heuristic — select the feasible bin whose load vector
   // is most orthogonal to the item's resource vector (minimizes cosine).
   {
+    const int32_t max_models = FLAGS_max_models_per_gpu_in_steady_pool;
     SteadyBin* best_bin = nullptr;
     double best_cos = std::numeric_limits<double>::max();
 
     for (auto& bin : steady_bins_) {
+      if (max_models > 0 &&
+          static_cast<int32_t>(bin.models.size()) >= max_models) {
+        continue;
+      }
       if (bin.remaining_hbm_gb >= needs.hbm_gb &&
           bin.remaining_compute_sm >= needs.compute_sm &&
           bin.remaining_bandwidth >= needs.bandwidth) {
@@ -2947,6 +3312,14 @@ std::string InstanceMgr::find_or_create_steady_bin(
     for (const auto& [inst_name, _] : instances_) {
       if (get_instance_tag(inst_name) != InstanceTag::NONE) continue;
       if (!has_valid_xtensor_info(inst_name)) continue;
+
+      bool has_existing_bin = false;
+      for (const auto& bin : steady_bins_) {
+        if (bin.instance_name == inst_name) { has_existing_bin = true; break; }
+      }
+      if (has_existing_bin) continue;
+
+      if (elastic_occupied_instances_.count(inst_name)) continue;
 
       uint64_t free_bytes = get_instance_free_bytes(inst_name);
       double free_gb = static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0);
@@ -3002,6 +3375,14 @@ std::string InstanceMgr::find_or_create_steady_bin(
     for (const auto& [inst_name, _] : instances_) {
       if (get_instance_tag(inst_name) != InstanceTag::NONE) continue;
       if (!has_valid_xtensor_info(inst_name)) continue;
+
+      bool has_existing_bin = false;
+      for (const auto& bin : steady_bins_) {
+        if (bin.instance_name == inst_name) { has_existing_bin = true; break; }
+      }
+      if (has_existing_bin) continue;
+
+      if (elastic_occupied_instances_.count(inst_name)) continue;
 
       uint64_t free_bytes = get_instance_free_bytes(inst_name);
       double free_gb = static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0);
@@ -3302,6 +3683,7 @@ InstanceMgr::repack_steady_bins() {
   // Build new bins with FFD + min cos placement
   std::vector<SteadyBin> new_bins;
   size_t next_old_instance = 0;
+  const int32_t max_models = FLAGS_max_models_per_gpu_in_steady_pool;
 
   for (const auto& item : items) {
     bool placed = false;
@@ -3310,6 +3692,10 @@ InstanceMgr::repack_steady_bins() {
     SteadyBin* best = nullptr;
     double best_cos = std::numeric_limits<double>::max();
     for (auto& bin : new_bins) {
+      if (max_models > 0 &&
+          static_cast<int32_t>(bin.models.size()) >= max_models) {
+        continue;
+      }
       if (bin.remaining_hbm_gb >= item.needs.hbm_gb &&
           bin.remaining_compute_sm >= item.needs.compute_sm &&
           bin.remaining_bandwidth >= item.needs.bandwidth) {
@@ -3498,8 +3884,8 @@ void InstanceMgr::elastic_to_steady_demotion() {
       auto model_mgr = get_model_instance_mgr(model_id);
       if (!model_mgr) continue;
 
-      int32_t gpu_target = compute_gpu_target_for_model(model_id);
-      // treat zero-rate as 0 target (model is idle)
+      auto stats = model_mgr->get_traffic_stats();
+      int32_t gpu_target = compute_elastic_gpu_target_from_rate(stats.token_rate);
       if (model_mgr->get_model_heat() == 0) gpu_target = 0;
 
       if (gpu_target != 1) {
@@ -3541,7 +3927,8 @@ void InstanceMgr::elastic_to_steady_demotion() {
       continue;
     }
 
-    int32_t gpu_target = compute_gpu_target_for_model(model_id);
+    auto stats = model_mgr->get_traffic_stats();
+    int32_t gpu_target = compute_elastic_gpu_target_from_rate(stats.token_rate);
     if (model_mgr->get_model_heat() == 0) gpu_target = 0;
     if (gpu_target != 1) {
       elastic_low_demand_since_.erase(model_id);

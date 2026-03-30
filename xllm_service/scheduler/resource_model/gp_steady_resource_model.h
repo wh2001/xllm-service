@@ -24,13 +24,11 @@ limitations under the License.
 namespace xllm_service {
 
 // GP-based resource model for the steady pool.
-// Uses 3 independent GPs (one per output dimension):
-//   GP[0]: 4D input -> per-GPU HBM usage (GB)
-//   GP[1]: 4D input -> per-GPU compute SM utilization [0, 1]
-//   GP[2]: 4D input -> per-GPU HBM-to-SRAM bandwidth utilization [0, 1]
-//
-// Input dimensions:
-//   (avg_tokens_per_sec, avg_input_len, avg_input_len², avg_output_len)
+// Uses 3 independent GPs with shared 3D input:
+//   Input: [token_rate, avg_input_len, avg_output_len]
+//   GP[hbm]:       -> per-GPU HBM usage (GB)
+//   GP[compute]:   -> per-GPU compute SM utilization [0, 1]
+//   GP[bandwidth]: -> per-GPU HBM-to-SRAM bandwidth utilization [0, 1]
 class GPSteadyResourceModel final : public ResourceModel {
  public:
   GPSteadyResourceModel(std::unique_ptr<GaussianProcess> gp_hbm,

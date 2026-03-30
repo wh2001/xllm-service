@@ -96,3 +96,11 @@ DECLARE_bool(disable_elastic_pool);
 DECLARE_int32(elastic_instance_count);
 
 DECLARE_string(models_config_path);
+
+DECLARE_string(pool_memory_log_path);
+
+DECLARE_string(check_memory_log_path);
+
+DECLARE_double(overlap_abundance_gb);
+
+DECLARE_int32(max_models_per_gpu_in_steady_pool);

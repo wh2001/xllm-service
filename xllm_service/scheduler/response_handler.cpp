@@ -25,7 +25,7 @@ bool ResponseHandler::send_delta_to_client(
     int64_t created_time,
     const std::string& model,
     const llm::RequestOutput& output) {
-  auto& response = call_data->response();
+  llm::proto::ChatResponse response;
 
   // send delta to client
   for (const auto& seq_output : output.outputs) {
@@ -127,7 +127,6 @@ bool ResponseHandler::send_delta_to_client(
   }
 
   if (output.finished) {
-    response.Clear();
     return call_data->finish();
   }
   return true;
@@ -140,7 +139,7 @@ bool ResponseHandler::send_delta_to_client(
     int64_t created_time,
     const std::string& model,
     const llm::RequestOutput& output) {
-  auto& response = call_data->response();
+  llm::proto::CompletionResponse response;
 
   for (const auto& seq_output : output.outputs) {
     // send chunk with delta message
@@ -208,7 +207,6 @@ bool ResponseHandler::send_delta_to_client(
   }
 
   if (output.finished) {
-    response.Clear();
     // TODO: convert status to grpc status code
     return call_data->finish();
   }
@@ -221,7 +219,7 @@ bool ResponseHandler::send_result_to_client(
     int64_t created_time,
     const std::string& model,
     const llm::RequestOutput& req_output) {
-  auto& response = call_data->response();
+  llm::proto::ChatResponse response;
   response.set_object("chat.completion");
   response.set_id(request_id);
   response.set_created(created_time);
@@ -283,7 +281,7 @@ bool ResponseHandler::send_result_to_client(
     int64_t created_time,
     const std::string& model,
     const llm::RequestOutput& req_output) {
-  auto& response = call_data->response();
+  llm::proto::CompletionResponse response;
   response.set_object("text_completion");
   response.set_id(request_id);
   response.set_created(created_time);

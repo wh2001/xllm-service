@@ -16,6 +16,8 @@ limitations under the License.
 #include "scheduler/managers/model_instance_mgr.h"
 #include <glog/logging.h>
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <brpc/controller.h>
 #include <nlohmann/json.hpp>
 
@@ -177,18 +179,39 @@ bool ModelInstanceMgr::send_model_sleep(const std::string& instance_name, std::s
   sleep_body["model_id"] = model_id_;
   sleep_body["master_status"] = 1;
 
-  // TODO: add retries
-  if (send_http_request(channel, "/sleep", sleep_body.dump())) {
-    LOG(INFO) << "Model " << model_id_ << " on " << instance_name
-              << " trigger sleep success.";
-    set_model_state(instance_name, ModelState::SLEEP);
-    return true;
-  } else {
-    LOG(ERROR) << "Failed to sleep model " << model_id_ << " on "
-               << instance_name;
-    return false;
+  static constexpr int kMaxSleepRetries = 10;
+  static constexpr int kSleepRetryIntervalMs = 100;
+
+  for (int attempt = 0; attempt < kMaxSleepRetries; ++attempt) {
+    std::string error_text;
+    if (send_http_request(channel, "/sleep", sleep_body.dump(), &error_text)) {
+      LOG(INFO) << "Model " << model_id_ << " on " << instance_name
+                << " trigger sleep success.";
+      set_model_state(instance_name, ModelState::SLEEP);
+      return true;
+    }
+
+    if (error_text.find("already sleeping") != std::string::npos) {
+      LOG(WARNING) << "Model " << model_id_ << " on " << instance_name
+                   << " is already sleeping, treating as sleep success.";
+      set_model_state(instance_name, ModelState::SLEEP);
+      return true;
+    }
+
+    if (error_text.find("Internal Server Error") != std::string::npos) {
+      LOG(ERROR) << "Failed to sleep model " << model_id_ << " on "
+                 << instance_name << ", non-retryable server error: " << error_text;
+      return false;
+    }
+
+    LOG(WARNING) << "Failed to sleep model " << model_id_ << " on "
+                 << instance_name << ", retry " << attempt + 1
+                 << "/" << kMaxSleepRetries << ", error: " << error_text;
+    std::this_thread::sleep_for(std::chrono::milliseconds(kSleepRetryIntervalMs));
   }
 
+  LOG(ERROR) << "Failed to sleep model " << model_id_ << " on "
+             << instance_name << " after " << kMaxSleepRetries << " retries";
   return false;
 }
 
@@ -208,27 +231,42 @@ bool ModelInstanceMgr::send_model_wakeup(const std::string& instance_name, std::
   wakeup_body["model_id"] = model_id_;
   wakeup_body["master_status"] = 0;
 
-  // TODO: add retries
-  std::string error_text;
-  if (send_http_request(channel, "/wakeup", wakeup_body.dump(), &error_text)) {
-    LOG(INFO) << "Model " << model_id_ << " on " << instance_name
-              << " trigger wakeup (H2D) success.";
-    set_model_state(instance_name, ModelState::WAKEUP);
-    return true;
-  } else {
-    // "already awake" means the model is actually running — treat as success
+  static constexpr int kMaxWakeupRetries = 10;
+  static constexpr int kWakeupRetryIntervalMs = 100;
+
+  for (int attempt = 0; attempt < kMaxWakeupRetries; ++attempt) {
+    std::string error_text;
+    if (send_http_request(channel, "/wakeup", wakeup_body.dump(), &error_text)) {
+      LOG(INFO) << "Model " << model_id_ << " on " << instance_name
+                << " trigger wakeup (H2D) success.";
+      set_model_state(instance_name, ModelState::WAKEUP);
+      return true;
+    }
+
     if (error_text.find("already awake") != std::string::npos) {
       LOG(WARNING) << "Model " << model_id_ << " on " << instance_name
                    << " is already awake, treating as wakeup success.";
       set_model_state(instance_name, ModelState::WAKEUP);
       return true;
     }
-    LOG(ERROR) << "Failed to wakeup model " << model_id_
-               << " on " << instance_name;
-    set_model_state(instance_name, ModelState::SLEEP);
-    return false;
+
+    if (error_text.find("Internal Server Error") != std::string::npos) {
+      LOG(ERROR) << "Failed to wakeup model " << model_id_
+                 << " on " << instance_name
+                 << ", non-retryable server error: " << error_text;
+      set_model_state(instance_name, ModelState::SLEEP);
+      return false;
+    }
+
+    LOG(WARNING) << "Failed to wakeup model " << model_id_
+                 << " on " << instance_name << ", retry " << attempt + 1
+                 << "/" << kMaxWakeupRetries << ", error: " << error_text;
+    std::this_thread::sleep_for(std::chrono::milliseconds(kWakeupRetryIntervalMs));
   }
 
+  LOG(ERROR) << "Failed to wakeup model " << model_id_
+             << " on " << instance_name << " after " << kMaxWakeupRetries << " retries";
+  set_model_state(instance_name, ModelState::SLEEP);
   return false;
 }
 
@@ -278,27 +316,44 @@ bool ModelInstanceMgr::send_model_wakeup_d2d(const std::string& instance_name,
             << " from source " << d2d_info.source_instance_name
             << " with " << d2d_info.remote_addrs.size() << " remote addrs";
 
-  // TODO: add retries
-  std::string error_text;
-  if (send_http_request(channel, "/wakeup", wakeup_body.dump(), &error_text)) {
-    LOG(INFO) << "Model " << model_id_ << " on " << instance_name
-              << " trigger wakeup (D2D) success.";
-    set_model_state(instance_name, ModelState::WAKEUP);
-    return true;
-  } else {
-    // "already awake" means the model is actually running — treat as success
+  static constexpr int kMaxD2DWakeupRetries = 10;
+  static constexpr int kD2DWakeupRetryIntervalMs = 100;
+
+  for (int attempt = 0; attempt < kMaxD2DWakeupRetries; ++attempt) {
+    std::string error_text;
+    if (send_http_request(channel, "/wakeup", wakeup_body.dump(), &error_text)) {
+      LOG(INFO) << "Model " << model_id_ << " on " << instance_name
+                << " trigger wakeup (D2D) success.";
+      set_model_state(instance_name, ModelState::WAKEUP);
+      return true;
+    }
+
     if (error_text.find("already awake") != std::string::npos) {
       LOG(WARNING) << "Model " << model_id_ << " on " << instance_name
                    << " is already awake, treating as D2D wakeup success.";
       set_model_state(instance_name, ModelState::WAKEUP);
       return true;
     }
-    LOG(ERROR) << "Failed to wakeup model " << model_id_
-               << " on " << instance_name << " with D2D transfer";
-    set_model_state(instance_name, ModelState::SLEEP);
-    return false;
+
+    if (error_text.find("Internal Server Error") != std::string::npos) {
+      LOG(ERROR) << "Failed to wakeup model " << model_id_
+                 << " on " << instance_name
+                 << " with D2D transfer, non-retryable server error: " << error_text;
+      set_model_state(instance_name, ModelState::SLEEP);
+      return false;
+    }
+
+    LOG(WARNING) << "Failed to wakeup model " << model_id_
+                 << " on " << instance_name << " with D2D transfer, retry "
+                 << attempt + 1 << "/" << kMaxD2DWakeupRetries
+                 << ", error: " << error_text;
+    std::this_thread::sleep_for(std::chrono::milliseconds(kD2DWakeupRetryIntervalMs));
   }
 
+  LOG(ERROR) << "Failed to wakeup model " << model_id_
+             << " on " << instance_name << " with D2D transfer after "
+             << kMaxD2DWakeupRetries << " retries";
+  set_model_state(instance_name, ModelState::SLEEP);
   return false;
 }
 

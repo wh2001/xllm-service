@@ -131,7 +131,7 @@ DEFINE_bool(enable_prefill_only_mode,
             "(prefill-only elastic pool mode).");
 
 DEFINE_double(gpu_hbm_per_gpu_gb,
-              60.0,
+              58.0,
               "HBM capacity per GPU in GB, used for auto-scaling resource model.");
 
 DEFINE_double(gpu_compute_sm_per_gpu,
@@ -185,3 +185,24 @@ DEFINE_string(models_config_path,
               "pairs to be served. Each entry must have \"service\" and "
               "\"model_path\" fields. When set, this file is loaded at startup "
               "instead of using the hardcoded MODELS list.");
+
+DEFINE_string(pool_memory_log_path,
+              "",
+              "Path to a dedicated log file for pool allocation and GPU memory "
+              "utilization stats (written every 10s). Empty means use glog INFO.");
+
+DEFINE_string(check_memory_log_path,
+              "",
+              "Path to a dedicated log file for per-instance XTensor heartbeat "
+              "memory details (written every 1s). Used for memory leak diagnosis.");
+
+DEFINE_double(overlap_abundance_gb,
+              10.0,
+              "Extra memory headroom (in GB) required for overlapped scale-up/"
+              "scale-down. A GPU is eligible for overlapped scaling only when "
+              "free_bytes >= new_model_size + overlap_abundance_gb.");
+
+DEFINE_int32(max_models_per_gpu_in_steady_pool,
+             2,
+             "Maximum number of models that can be co-located on a single GPU "
+             "instance in the steady pool. 0 means no limit (resource-only).");

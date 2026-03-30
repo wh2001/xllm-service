@@ -542,7 +542,7 @@ struct D2DWakeupInfo {
 };
 
 struct GpuHardwareSpec {
-  double hbm_per_gpu_gb = 80.0;
+  double hbm_per_gpu_gb = 58.0;
   double compute_sm_per_gpu = 1.0;
   double bandwidth_per_gpu = 1.0;  // HBM-to-SRAM bandwidth capacity (normalized)
 };

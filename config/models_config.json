@@ -1,4 +1,5 @@
 [
+  {"service": "Qwen3-1.7B",                            "model_path": "/export/home/models/Qwen3-1.7B"},
   {"service": "aibot_aigo-comment-summary",            "model_path": "/export/home/models/Qwen3-8B"},
   {"service": "aibot_aigo-price-extract",              "model_path": "/export/home/models/Qwen3-8B"},
   {"service": "aibot_aigo-query-rewrite",              "model_path": "/export/home/models/Qwen3-8B"},

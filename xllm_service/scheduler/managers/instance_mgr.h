@@ -295,13 +295,24 @@ class InstanceMgr final {
 
   bool send_http_request(std::shared_ptr<brpc::Channel> channel,
                          const std::string& uri,
-                         const std::string& request_body);
+                         const std::string& request_body,
+                         int timeout_ms = -1);
+
+  // Ask a remote xllm instance for a locally-free port.
+  // Returns the port number, or -1 on failure.
+  int request_free_port(std::shared_ptr<brpc::Channel> channel);
 
   // Periodic low-frequency diagnostics for model P/D allocations.
   void log_model_pd_counts();
 
   // Periodic diagnostics for total instance counts (model-independent).
   void log_instance_counts();
+
+  // Periodic pool & GPU memory utilization stats (called every 10s).
+  void log_pool_memory_stats();
+
+  // Per-instance XTensor heartbeat details for memory leak diagnosis (called every 1s).
+  void log_xtensor_heartbeat_details();
 
  private:
   DISALLOW_COPY_AND_ASSIGN(InstanceMgr);
@@ -490,7 +501,7 @@ class InstanceMgr final {
   // Prevents concurrent scale-up loops from assigning multiple DECODE tags.
   std::unordered_set<std::string> elastic_decode_reserved_models_;
 
-  ThreadPool threadpool_;
+  ThreadPool threadpool_{64};
 };
 
 }  // namespace xllm_service

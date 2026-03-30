@@ -34,7 +34,7 @@ LstImhPolicy::LstImhPolicy(const Options& options,
     : options_(options), LoadBalancePolicy(instance_mgr) {
   coordinator_thread_ =
       std::make_unique<std::thread>(&LstImhPolicy::dispatch_coordinator, this);
-  LOG(INFO) << "LST-IMH scheduling mode enabled (as LoadBalancePolicy).";
+  // LOG(INFO) << "LST-IMH scheduling mode enabled (as LoadBalancePolicy).";
 }
 
 LstImhPolicy::~LstImhPolicy() { shutdown(); }
@@ -165,8 +165,8 @@ void LstImhPolicy::signal_dispatch() {
 void LstImhPolicy::dispatch_coordinator() {
   const int64_t pre_pull_ms =
       static_cast<int64_t>(options_.lst_imh_pre_pull_ms());
-  LOG(INFO) << "[LST-IMH] dispatch_coordinator started, pre_pull_ms="
-            << pre_pull_ms;
+  // LOG(INFO) << "[LST-IMH] dispatch_coordinator started, pre_pull_ms="
+  //           << pre_pull_ms;
 
   while (!exited_) {
     // ---- Phase 1: Compute next wake time from EPDT across all models ----
@@ -271,11 +271,11 @@ void LstImhPolicy::dispatch_coordinator() {
               entry->slo_expansion_count++;
               int64_t new_deadline =
                   entry->request->arrival_time_ms + entry->request->ttft_slo_ms;
-              LOG(INFO) << "[LST-IMH] Request "
-                        << entry->request->service_request_id
-                        << " SLO expanded (x" << entry->slo_expansion_count
-                        << ", new_slo=" << entry->request->ttft_slo_ms
-                        << "ms, new_deadline=" << new_deadline << ")";
+              // LOG(INFO) << "[LST-IMH] Request "
+              //           << entry->request->service_request_id
+              //           << " SLO expanded (x" << entry->slo_expansion_count
+              //           << ", new_slo=" << entry->request->ttft_slo_ms
+              //           << "ms, new_deadline=" << new_deadline << ")";
               jobs.push_back({entry->request,
                               entry->request->estimated_processing_time_ms,
                               new_deadline});

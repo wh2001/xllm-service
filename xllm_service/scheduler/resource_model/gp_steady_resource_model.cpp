@@ -33,8 +33,9 @@ GPSteadyResourceModel::GPSteadyResourceModel(
 ResourceNeeds GPSteadyResourceModel::calc_3d_resources(
     double token_rate, double avg_input_len, double avg_input_len2,
     double avg_output_len) const {
-  Eigen::VectorXd x(4);
-  x << token_rate, avg_input_len, avg_input_len2, avg_output_len;
+  // All 3 GPs use the same 3D input: [token_rate, avg_input_len, avg_output_len]
+  Eigen::VectorXd x(3);
+  x << token_rate, avg_input_len, avg_output_len;
 
   ResourceNeeds needs;
   needs.hbm_gb = std::max(gp_hbm_->predict_mean(x), 0.0) + 5.0;
