@@ -202,7 +202,15 @@ int main(int argc, char* argv[]) {
       .max_slo_expansions(FLAGS_max_slo_expansions)
       .disable_steady_pool(FLAGS_disable_steady_pool)
       .disable_elastic_pool(FLAGS_disable_elastic_pool)
-      .elastic_instance_count(FLAGS_elastic_instance_count);
+      .elastic_instance_count(FLAGS_elastic_instance_count)
+      .tensor_parallel_size(FLAGS_tensor_parallel_size);
+
+  if (options.tensor_parallel_size() < 1) {
+    LOG(ERROR) << "tensor_parallel_size must be >= 1, got "
+               << options.tensor_parallel_size();
+    return -1;
+  }
+  LOG(INFO) << "Tensor parallel size: " << options.tensor_parallel_size();
 
   if (options.disable_steady_pool() && options.disable_elastic_pool()) {
     LOG(ERROR) << "disable_steady_pool and disable_elastic_pool cannot both "

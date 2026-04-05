@@ -1,0 +1,18 @@
+{
+    "aibot_sku-compare-v2-060":              "Qwen2.5-14B",
+    "aisr_qwen3-32b-ab-test":                "Qwen3-32B",
+    "aisr_qwen3-32b-quan":                   "Qwen3-32B",
+    "aisr_qwen3-32b-tp4":                    "Qwen3-32B",
+    "aisr_qwen3-32b-tp8":                    "Qwen3-32B",
+    "aisr_qwen3-32b-tp8-test":               "Qwen3-32B",
+    "data-agent-qwen32b_easybi-qwen32b":     "Qwen3-32B",
+    "data-agent-qwen32b_easybi-qwen32b-hc":  "Qwen3-32B",
+    "data-agent-qwen32b_mix-qwen32b-hc":     "Qwen3-32B",
+    "data-agent-qwen32b_query":              "Qwen3-32B",
+    "data-agent-qwen32b_query-2":            "Qwen3-32B",
+    "data-agent-qwen32b_qwen32b-coder-hc":   "Qwen3-32B",
+    "data-agent-qwen32b_qwen32b-hc1":        "Qwen3-32B",
+    "proxy_compare-test-32b":                 "Qwen3-32B",
+    "proxy_qwen3-32b":                        "Qwen3-32B",
+    "proxy_qwen3-vl-32b":                     "Qwen3-32B"
+}

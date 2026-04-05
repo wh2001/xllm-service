@@ -206,3 +206,15 @@ DEFINE_int32(max_models_per_gpu_in_steady_pool,
              2,
              "Maximum number of models that can be co-located on a single GPU "
              "instance in the steady pool. 0 means no limit (resource-only).");
+
+DEFINE_int32(tensor_parallel_size,
+             1,
+             "Number of GPUs used for tensor parallelism per instance. "
+             "Each instance occupies this many GPUs.");
+
+DEFINE_string(initial_model_id,
+              "",
+              "Model ID of the initial model loaded by xllm via --model. "
+              "When non-empty, xllm-service will send a /sleep request to "
+              "each xllm instance before fork_master_and_sleep to free GPU "
+              "memory occupied by the initial model.");

@@ -1,0 +1,8 @@
+[
+  {"service": "kf-service_yongyan-bicls",              "model_path": "/export/home/models/Qwen3-8B"},
+  {"service": "aibot_search-recomm-text",              "model_path": "/export/home/models/Qwen3-8B"},
+  {"service": "audit_knife-v2",                        "model_path": "/export/home/models/Qwen3-8B"},
+  {"service": "aibot_aigo-price-extract",               "model_path": "/export/home/models/Qwen3-8B"},
+  {"service": "kf-service_yongyan-multicls",            "model_path": "/export/home/models/Qwen3-8B"},
+  {"service": "proxy_a-comp-qwen3-8b",                  "model_path": "/export/home/models/Qwen3-8B"}
+]

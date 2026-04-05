@@ -100,6 +100,9 @@ class Options {
   // Path to JSON file that maps service names to model paths.
   // When non-empty, MODELS is loaded from this file at startup.
   PROPERTY(std::string, models_config_path);
+
+  // Number of GPUs used for tensor parallelism per instance.
+  PROPERTY(int32_t, tensor_parallel_size) = 1;
 };
 
 }  // namespace xllm_service

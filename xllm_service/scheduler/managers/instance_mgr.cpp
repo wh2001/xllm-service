@@ -231,7 +231,7 @@ void InstanceMgr::init() {
   // Start low-frequency P/D metrics thread.
   static constexpr int kPdMetricsIntervalSeconds = 1;
   static constexpr int kInstanceMetricsIntervalTicks = 60;
-  static constexpr int kPoolMemoryStatsIntervalTicks = 10;
+  static constexpr int kPoolMemoryStatsIntervalTicks = 1;
   pd_metrics_thread_ = std::make_unique<std::thread>([this]() {
     int tick = 0;
     while (!exited_) {
@@ -271,7 +271,7 @@ void InstanceMgr::init() {
     // Sync total_available_gpus_ with instances loaded from etcd, so that
     // subsequent deletes (which call fetch_sub) don't drive the counter negative.
     total_available_gpus_.store(
-        static_cast<int32_t>(instances_.size()) * kTensorParallelSize);
+        static_cast<int32_t>(instances_.size()) * options_.tensor_parallel_size());
     LOG(INFO) << "Load instance info from etcd:" << instances_.size();
     std::vector<std::string> channel_creat_fail_insts;
     for (auto& ist : instances_) {
@@ -396,9 +396,9 @@ void InstanceMgr::log_pool_memory_stats() {
   }
 
   const int steady_instances = static_cast<int>(steady_instance_names.size());
-  const int steady_gpus = steady_instances * kTensorParallelSize;
+  const int steady_gpus = steady_instances * options_.tensor_parallel_size();
   const int elastic_instances = static_cast<int>(elastic_instance_names.size());
-  const int elastic_gpus = elastic_instances * kTensorParallelSize;
+  const int elastic_gpus = elastic_instances * options_.tensor_parallel_size();
 
   // 4. Compute per-pool GPU memory utilization from XTensor heartbeat data.
   const double total_hbm_per_gpu_bytes =
@@ -826,6 +826,33 @@ void InstanceMgr::fork_master_and_sleep(
     const std::string& instance_name,
     std::shared_ptr<brpc::Channel> channel) {
   LOG(INFO) << "Forking master and sleeping for instance " << instance_name;
+
+  if (!FLAGS_initial_model_id.empty()) {
+    LOG(INFO) << "Sleeping initial model " << FLAGS_initial_model_id
+              << " on instance " << instance_name
+              << " to free GPU memory before fork";
+    nlohmann::json sleep_body;
+    sleep_body["model_id"] = FLAGS_initial_model_id;
+    sleep_body["master_status"] = 2;  // LIGHT_SLEEP
+    static constexpr int kMaxSleepRetries = 10;
+    bool sleep_succeeded = false;
+    for (int attempt = 0; attempt < kMaxSleepRetries && !sleep_succeeded; ++attempt) {
+      if (send_http_request(channel, "/sleep", sleep_body.dump())) {
+        sleep_succeeded = true;
+      } else {
+        LOG(WARNING) << "Failed to sleep initial model " << FLAGS_initial_model_id
+                     << " on instance " << instance_name
+                     << ", attempt " << attempt + 1 << "/" << kMaxSleepRetries;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+      }
+    }
+    if (!sleep_succeeded) {
+      LOG(ERROR) << "Failed to sleep initial model " << FLAGS_initial_model_id
+                 << " on instance " << instance_name
+                 << " after " << kMaxSleepRetries << " retries";
+    }
+  }
+
   for (const auto& model : MODELS) {
     // 1. Fork Master
 
@@ -856,12 +883,12 @@ void InstanceMgr::fork_master_and_sleep(
       fork_body["model_path"] = model.second;
       fork_body["master_node_addr"] = "127.0.0.1:" + std::to_string(master_port);
       fork_body["master_status"] = 1;
-      fork_body["nnodes"] = kTensorParallelSize;
+      fork_body["nnodes"] = options_.tensor_parallel_size();
 
       std::vector<std::thread> fork_threads;
       std::atomic<int> fork_success_count(0);
 
-      for (int node_idx = 0; node_idx < kTensorParallelSize; ++node_idx) {
+      for (int node_idx = 0; node_idx < options_.tensor_parallel_size(); ++node_idx) {
 
         /* hardcoded for now */
         int tmp_port = base_port + node_idx;
@@ -878,7 +905,7 @@ void InstanceMgr::fork_master_and_sleep(
           if (node_idx > 0) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
           }
-          static constexpr int kForkTimeoutMs = 120000;
+          static constexpr int kForkTimeoutMs = 600000;
           if (send_http_request(tmp_channel, "/fork_master",
                                 fork_body.dump(), kForkTimeoutMs)) {
             fork_success_count += 1;
@@ -895,7 +922,7 @@ void InstanceMgr::fork_master_and_sleep(
         }
       }
 
-      if (fork_success_count.load() == kTensorParallelSize) {
+      if (fork_success_count.load() == options_.tensor_parallel_size()) {
         fork_succeeded = true;
         LOG(INFO) << "Fork master succeeded for model " << model_id
                   << " on instance " << instance_name
@@ -1194,8 +1221,8 @@ void InstanceMgr::register_instance(const std::string& instance_name,
   }
 
   /* hardcoded for now*/
-  if (kTensorParallelSize > 1) {
-    for (int node_idx = 1; node_idx < kTensorParallelSize; ++node_idx) {
+  if (options_.tensor_parallel_size() > 1) {
+    for (int node_idx = 1; node_idx < options_.tensor_parallel_size(); ++node_idx) {
       int instance_port = stoi(instance_name.substr(instance_name.find(":") + 1));
       int tmp_port = instance_port + node_idx;
       std::string tmp_instance_name = instance_name.substr(0, instance_name.find(":")) +
@@ -1273,7 +1300,7 @@ void InstanceMgr::register_instance(const std::string& instance_name,
   LOG(INFO) << "Registered instance " << instance_name << " type " << (int)metainfo.type;
 
   instances_.insert(std::make_pair(instance_name, std::move(metainfo)));
-  total_available_gpus_.fetch_add(kTensorParallelSize);
+  total_available_gpus_.fetch_add(options_.tensor_parallel_size());
 }
 
 std::shared_ptr<brpc::Channel> InstanceMgr::get_channel(
@@ -1414,7 +1441,7 @@ void InstanceMgr::update_instance_metainfo(const etcd::Response& response,
 
         instances_.erase(iter);
         cached_channels_.erase(iter);
-        total_available_gpus_.fetch_sub(kTensorParallelSize);
+        total_available_gpus_.fetch_sub(options_.tensor_parallel_size());
         {
           std::lock_guard<std::mutex> time_predictor_lock(
               time_predictor_mutex_);
@@ -1794,7 +1821,7 @@ double InstanceMgr::predict_ttft(const std::string& instance_name,
     }
   }
   // Fallback: ttft_ms = 0.0678 * tokens + 19.63 (fitted from profiling)
-  return static_cast<double>(token_count) * 0.0678 + 19.63;
+  return static_cast<double>(token_count) * 0.0964 + 67.27;
 }
 
 double InstanceMgr::predict_ttft_any_instance(const std::string& model_id,
@@ -1807,7 +1834,7 @@ double InstanceMgr::predict_ttft_any_instance(const std::string& model_id,
     }
   }
   // Fallback: ttft_ms = 0.0678 * tokens + 19.63 (fitted from profiling)
-  return static_cast<double>(token_count) * 0.0678 + 19.63;
+  return static_cast<double>(token_count) * 0.0964 + 67.27;
 }
 
 void InstanceMgr::send_model_sleep(const std::string& instance_name,
@@ -3062,7 +3089,7 @@ bool InstanceMgr::is_steady_pool_instance(const std::string& instance_name) {
 }
 
 int32_t InstanceMgr::steady_needed_gpus() {
-  return static_cast<int32_t>(steady_bins_.size()) * kTensorParallelSize
+  return static_cast<int32_t>(steady_bins_.size()) * options_.tensor_parallel_size()
       + pending_steady_gpus_;
 }
 
@@ -3348,7 +3375,7 @@ std::string InstanceMgr::find_or_create_steady_bin(
   if (!allow_reclaim) {
     return "";
   }
-  pending_steady_gpus_ += kTensorParallelSize;
+  pending_steady_gpus_ += options_.tensor_parallel_size();
 
   // Trigger auto-scaling thread to run immediately (will shrink elastic pool).
   {
@@ -3405,7 +3432,7 @@ std::string InstanceMgr::find_or_create_steady_bin(
     }
   }
 
-  pending_steady_gpus_ -= kTensorParallelSize;
+  pending_steady_gpus_ -= options_.tensor_parallel_size();
 
   if (!found_instance.empty()) {
     LOG(INFO) << "Reclaimed instance " << found_instance

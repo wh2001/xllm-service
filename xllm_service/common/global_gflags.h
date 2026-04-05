@@ -104,3 +104,7 @@ DECLARE_string(check_memory_log_path);
 DECLARE_double(overlap_abundance_gb);
 
 DECLARE_int32(max_models_per_gpu_in_steady_pool);
+
+DECLARE_int32(tensor_parallel_size);
+
+DECLARE_string(initial_model_id);

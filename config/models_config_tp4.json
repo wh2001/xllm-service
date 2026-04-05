@@ -1,0 +1,18 @@
+[
+  {"service": "aibot_sku-compare-v2-060",              "model_path": "/export/home/models/Qwen2.5-14B"},
+  {"service": "aisr_qwen3-32b-ab-test",                "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "aisr_qwen3-32b-quan",                   "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "aisr_qwen3-32b-tp4",                    "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "aisr_qwen3-32b-tp8",                    "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "aisr_qwen3-32b-tp8-test",               "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "data-agent-qwen32b_easybi-qwen32b",     "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "data-agent-qwen32b_easybi-qwen32b-hc",  "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "data-agent-qwen32b_mix-qwen32b-hc",     "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "data-agent-qwen32b_query",              "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "data-agent-qwen32b_query-2",            "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "data-agent-qwen32b_qwen32b-coder-hc",   "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "data-agent-qwen32b_qwen32b-hc1",        "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "proxy_compare-test-32b",                 "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "proxy_qwen3-32b",                        "model_path": "/export/home/models/Qwen3-32B"},
+  {"service": "proxy_qwen3-vl-32b",                     "model_path": "/export/home/models/Qwen3-32B"}
+]

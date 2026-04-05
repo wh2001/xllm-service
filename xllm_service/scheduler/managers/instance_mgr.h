@@ -50,8 +50,6 @@ class InstanceMgr final {
 
   static constexpr int kMaxWakeupTimeoutms = 10000;
 
-  static constexpr int kTensorParallelSize = 1;
-
  public:
   explicit InstanceMgr(const Options& options,
                        const std::shared_ptr<EtcdClient>& etcd_client,

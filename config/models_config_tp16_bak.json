@@ -1,0 +1,8 @@
+[
+  {"service": "aibot_deepseek-v3",            "model_path": "/export/home/models/DeepSeek-V3"},
+  {"service": "kf-service_deepseek-v32",            "model_path": "/export/home/models/DeepSeek-V3"},
+  {"service": "kf-service_deepseek-v32-offline",            "model_path": "/export/home/models/DeepSeek-V3"},
+  {"service": "proxy_deepseek-v3hb",            "model_path": "/export/home/models/DeepSeek-V3"},
+  {"service": "proxy_jy-deepseek-v3-cache",            "model_path": "/export/home/models/DeepSeek-V3"},
+  {"service": "proxy_glm45-air-jy",            "model_path": "/export/home/models/DeepSeek-V3"}
+]

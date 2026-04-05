@@ -1,0 +1,4 @@
+[
+  {"service": "proxy_jy-deepseek-v3-cache",            "model_path": "/export/home/models/DeepSeek-V3"},
+  {"service": "proxy_glm45-air-jy",            "model_path": "/export/home/models/DeepSeek-V3"}
+]
